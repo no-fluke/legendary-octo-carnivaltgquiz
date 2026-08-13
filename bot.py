@@ -64,9 +64,9 @@ AUTO_VOTE     = True          # cast dummy vote to reveal correct answer (same a
 OUTPUT_JSON   = "quiz_output.json"
 OUTPUT_TXT    = "quiz_output.txt"
 
-# Self-ping to keep Render free tier alive
+# Self-ping to keep Render free tier alive AND keep the connection warm during long scrapes
 RENDER_URL    = os.getenv("RENDER_EXTERNAL_URL", "")   # set this in Render env vars
-PING_INTERVAL = 840                                     # every 14 min (Render sleeps at 15)
+PING_INTERVAL = 20                                      # every 20s — keeps Render alive during scraping
 PING_PORT     = int(os.getenv("PORT", "10000"))
 
 # ================== TELETHON SESSION HELPER ==============
@@ -1107,14 +1107,29 @@ async def send_via_bot(bot, items: list, title: str, chat_id, recreate_polls: bo
 
 # ==================== BACKGROUND SCRAPING =================
 
+async def _cleanup_image(image_path: Optional[str]):
+    """Delete a temporary image file after it has been sent."""
+    if image_path and os.path.exists(image_path):
+        try:
+            os.remove(image_path)
+        except Exception as e:
+            print(f"      ⚠️  Could not delete temp image {image_path}: {e}")
+
+
 async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_chat_id):
+    """
+    Streaming scrape: each quiz/text is sent to the destination immediately
+    after it is processed — no waiting for the full range to be collected first.
+    Images are downloaded, sent, and deleted on-the-spot to save memory and disk.
+    """
     user_id    = context.user_data["scrape_user_id"]
     channel_id = context.user_data["channel_id"]
     start_id   = context.user_data["start_id"]
     end_id     = context.user_data["end_id"]
 
-    await context.bot.send_message(chat_id=dest_chat_id, text="⏳ Scraping started…")
+    await context.bot.send_message(chat_id=dest_chat_id, text="⏳ Scraping started… quizzes will appear here as they are processed.")
 
+    client = None
     try:
         client = await get_client(user_id)
         if not await client.is_user_authorized():
@@ -1137,18 +1152,33 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
         print(f"  Msg range : {start_id} → {end_id} ({len(msg_ids)} messages)")
         print(f"  Auto-vote : {'ON ⚡' if AUTO_VOTE else 'OFF'}")
         print(f"  Dest chat : {dest_chat_id}")
+        print(f"  Mode      : STREAMING (send-as-you-go)")
         print(f"{'─'*58}\n")
 
-        # Fetch & process messages — same logic as polls3108 main()
-        items                 = []
+        # ── Counters (for the final summary) ──────────────────────────────
         total_fetched         = 0
+        quiz_counter          = 0
+        text_counter          = 0
         auto_voted_n          = 0
         already_done_n        = 0
         pending_image_path    = None
         pending_image_caption = ""
 
-        BATCH = 100
+        BATCH         = 100
         total_batches = (len(msg_ids) + BATCH - 1) // BATCH
+
+        # Header in destination so the receiver knows what's coming
+        try:
+            await context.bot.send_message(
+                chat_id    = dest_chat_id,
+                text       = (
+                    f"📚 *Quiz Export — {escape_md(title)}*\n"
+                    f"Range: `{start_id}` → `{end_id}` \\({len(msg_ids)} messages\\)"
+                ),
+                parse_mode = ParseMode.MARKDOWN_V2,
+            )
+        except Exception as e:
+            print(f"  ⚠️  Header send failed: {e}")
 
         for batch_num, batch_start in enumerate(range(0, len(msg_ids), BATCH), 1):
             batch    = msg_ids[batch_start:batch_start + BATCH]
@@ -1162,28 +1192,28 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
             for message in messages:
                 total_fetched += 1
 
-                # Plain text-only messages
-                if (
-                    not message.media
-                    and message.text
-                    and message.text.strip()
-                ):
-                    items.append({
-                        "type":       "text",
-                        "message_id": message.id,
-                        "date":       message.date.isoformat(),
-                        "text":       message.text,
-                    })
-                    print(f"  📝  Text msg #{message.id}: \"{message.text[:60]}\"")
+                # ── Plain text-only messages ───────────────────────────────
+                if not message.media and message.text and message.text.strip():
+                    text_counter += 1
+                    text = clean_text(message.text.strip())
+                    print(f"  📝  Text msg #{message.id}: \"{text[:60]}\"")
+                    chunks = [text[j:j+4000] for j in range(0, len(text), 4000)]
+                    for chunk in chunks:
+                        try:
+                            await context.bot.send_message(chat_id=dest_chat_id, text=chunk)
+                        except Exception as e:
+                            print(f"  ❌  Text msg #{message.id} failed: {e}")
+                        await asyncio.sleep(SEND_DELAY)
                     continue
 
-                # Poll / quiz messages
+                # ── Poll / quiz messages ───────────────────────────────────
                 if isinstance(message.media, MessageMediaPoll):
                     poll_caption = message.text or ""
                     poll_data    = parse_poll(message, caption=poll_caption)
                     if poll_data is None:
                         continue
 
+                    # Attach any image that immediately preceded this poll
                     if pending_image_path:
                         poll_data["image_path"]    = pending_image_path
                         poll_data["image_caption"] = pending_image_caption
@@ -1192,6 +1222,7 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
                     else:
                         poll_data["image_caption"] = ""
 
+                    # Reveal correct answer
                     if is_closed(message.media):
                         kind = "quiz" if poll_data["is_quiz"] else "poll"
                         print(f"  🔒  Closed {kind} — reading Final Results: \"{poll_data['question'][:50]}\"")
@@ -1211,11 +1242,37 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
                         already_done_n += 1
                         print(f"  ✔  Already answered: \"{poll_data['question'][:52]}\"")
 
-                    poll_data["type"] = "quiz"
-                    items.append(poll_data)
+                    # ── STREAM: send this quiz immediately ─────────────────
+                    quiz_counter += 1
+                    try:
+                        await recreate_quiz_poll(context.bot, poll_data, dest_chat_id, quiz_counter)
+                    except Exception as e:
+                        print(f"  ⚠️  Failed to send quiz #{quiz_counter}: {e}")
+                        try:
+                            plain = (
+                                f"Quiz #{quiz_counter}\nQ: {poll_data['question']}\n"
+                                + "\n".join(
+                                    f"  {ans['index']+1}. {ans['text']}"
+                                    + (" ✅" if ans["index"] == poll_data.get("correct_answer_index") else " ❌")
+                                    for ans in poll_data["answers"]
+                                )
+                            )
+                            if poll_data.get("explanation"):
+                                plain += f"\n\n💡 {poll_data['explanation']}"
+                            await context.bot.send_message(chat_id=dest_chat_id, text=plain)
+                        except Exception as e2:
+                            print(f"  ❌  Fallback also failed for #{quiz_counter}: {e2}")
 
-                # Image-only messages (photos or image documents — skip PDFs/other docs)
-                elif isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)):
+                    # Clean up the image from disk immediately after sending
+                    if poll_data.get("image_path"):
+                        await _cleanup_image(poll_data["image_path"])
+                        poll_data["image_path"] = None
+
+                    await asyncio.sleep(SEND_DELAY)
+                    continue
+
+                # ── Image-only messages (preceding a quiz) ─────────────────
+                if isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)):
                     doc  = getattr(message.media, "document", None)
                     mime = getattr(doc, "mime_type", "") if doc else ""
                     is_image = (
@@ -1223,133 +1280,100 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
                         or (mime and mime.startswith("image/"))
                     )
                     if not is_image:
-                        # PDF or other non-image document — queue it for forwarding
-                        print(f"  📄  Non-image doc at msg {message.id} (mime={mime or 'unknown'}) — queuing as document")
-                        items.append({
-                            "type":       "document",
-                            "message_id": message.id,
-                            "date":       message.date.isoformat(),
-                            "text":       message.text or "",
-                            "mime":       mime,
-                        })
+                        # PDF or other non-image doc — send a notice immediately
+                        print(f"  📄  Non-image doc at msg {message.id} (mime={mime or 'unknown'}) — sending notice")
+                        caption = (message.text or "").strip()
+                        label   = "📄 PDF" if "pdf" in mime else "📎 Document"
+                        note    = f"{label} (msg #{message.id})"
+                        if caption:
+                            note += f"\n{caption}"
+                        try:
+                            await context.bot.send_message(chat_id=dest_chat_id, text=note)
+                        except Exception as e:
+                            print(f"  ❌  Document notice failed: {e}")
+                        await asyncio.sleep(SEND_DELAY)
                         continue
+
+                    # It is an image — download and hold until the next poll arrives
+                    # Clean up any stale pending image first (orphan image with no following quiz)
+                    if pending_image_path:
+                        await _cleanup_image(pending_image_path)
+
                     image_path = await download_image(client, message, message.id)
                     if image_path:
                         pending_image_path    = image_path
                         pending_image_caption = message.text or ""
-                        print(f'      🖼️  Stored image from msg {message.id} with caption: "{pending_image_caption[:50]}"')
+                        print(f'      🖼️  Downloaded image from msg {message.id} (caption: "{pending_image_caption[:50]}")')
+                    continue
 
-        # Summary
-        quizzes   = [x for x in items if x["type"] == "quiz"]
-        text_msgs = [x for x in items if x["type"] == "text"]
+            # End of batch — small pause before next batch to avoid Telegram flood limits
+            if batch_num < total_batches:
+                print(f"  ⏸️  Batch {batch_num} done — pausing {BATCH_PAUSE}s before next batch…")
+                await asyncio.sleep(BATCH_PAUSE)
+
+        # If a trailing image was downloaded but no poll followed, clean it up
+        if pending_image_path:
+            await _cleanup_image(pending_image_path)
+            pending_image_path = None
+
+        await client.disconnect()
+        client = None
 
         print(f"\n{'═'*58}")
         print(f"  📨  Messages fetched : {total_fetched}")
-        print(f"  🧩  Quizzes found    : {len(quizzes)}")
-        print(f"  📝  Text messages    : {len(text_msgs)}")
+        print(f"  🧩  Quizzes sent     : {quiz_counter}")
+        print(f"  📝  Text messages    : {text_counter}")
         print(f"  🗳️  Auto-voted       : {auto_voted_n}")
         print(f"  ✅  Already answered : {already_done_n}")
         print(f"{'═'*58}\n")
 
-        if not items:
-            await context.bot.send_message(chat_id=dest_chat_id, text="⚠️ Nothing found in this message range.")
-            await client.disconnect()
-            return
+        if quiz_counter == 0 and text_counter == 0:
+            await context.bot.send_message(
+                chat_id=dest_chat_id,
+                text="⚠️ Nothing found in this message range."
+            )
 
-        # Strip raw bytes before JSON save
-        for q in quizzes:
-            for ans in q["answers"]:
-                ans.pop("option", None)
-
-        # Save JSON
-        try:
-            import json as _json
-            with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-                _json.dump({"quizzes": quizzes, "text_msgs": text_msgs}, f, ensure_ascii=False, indent=2)
-            print(f"  💾  JSON → {OUTPUT_JSON}")
-        except Exception as e:
-            print(f"  ⚠️  JSON save failed: {e}")
-
-        # Save TXT
-        try:
-            with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
-                f.write(f"Telegram Quiz Export — {title}\n")
-                f.write(f"Range: msg {start_id} → {end_id} | Quizzes: {len(quizzes)} | Text msgs: {len(text_msgs)}\n\n")
-                if quizzes:
-                    f.write("═"*60 + "\nQUIZZES\n" + "═"*60 + "\n\n")
-                    for i, quiz in enumerate(quizzes, 1):
-                        f.write(format_quiz_text(quiz, i) + "\n\n")
-                if text_msgs:
-                    f.write("═"*60 + "\nTEXT MESSAGES\n" + "═"*60 + "\n\n")
-                    for i, msg in enumerate(text_msgs, 1):
-                        f.write(f"[{i}] ID:{msg['message_id']} | {msg['date']}\n")
-                        f.write(msg["text"] + "\n\n")
-            print(f"  📄  TXT  → {OUTPUT_TXT}")
-        except Exception as e:
-            print(f"  ⚠️  TXT save failed: {e}")
-
-        # Send via bot using send_via_bot (same as polls3108)
-        await send_via_bot(
-            context.bot,
-            items,
-            title,
-            chat_id        = dest_chat_id,
-            recreate_polls = True,
-        )
-
-        await client.disconnect()
-
-        # ── Completion notification ──────────────────────────────────────────
+        # ── Completion notification ──────────────────────────────────────
         done_text = (
             "✅ *Scrape complete\\!*\n\n"
             f"📡 Channel: `{escape_md(title)}`\n"
             f"📨 Messages fetched: `{total_fetched}`\n"
-            f"🧩 Quizzes scraped: `{len(quizzes)}`\n"
-            f"📝 Text messages: `{len(text_msgs)}`\n"
+            f"🧩 Quizzes sent: `{quiz_counter}`\n"
+            f"📝 Text messages: `{text_counter}`\n"
             f"🗳️ Auto\\-voted: `{auto_voted_n}`\n\n"
-            f"📬 Results sent to: `{escape_md(str(dest_chat_id))}`"
+            f"📬 Sent to: `{escape_md(str(dest_chat_id))}`"
         )
-        # Always notify the user in their bot DM (even if dest is a different chat)
         await context.bot.send_message(
             chat_id    = user_id,
             text       = done_text,
             parse_mode = ParseMode.MARKDOWN_V2,
         )
-        # If the destination is a different chat, also send a brief done notice there
         if str(dest_chat_id) != str(user_id):
             await context.bot.send_message(
                 chat_id    = dest_chat_id,
-                text       = f"✅ *Done\\! {len(quizzes)} quiz\\(es\\) and {len(text_msgs)} text message\\(s\\) delivered\\.*",
+                text       = f"✅ *Done\\! {quiz_counter} quiz\\(es\\) and {text_counter} text message\\(s\\) delivered\\.*",
                 parse_mode = ParseMode.MARKDOWN_V2,
             )
 
     except asyncio.CancelledError:
         print("  ⚠️  run_scrape cancelled (bot shutting down)")
-        if "client" in locals():
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+        if pending_image_path:
+            await _cleanup_image(pending_image_path)
         raise  # let asyncio know it was properly handled
 
     except Exception as e:
         print(f"  ❌  run_scrape error: {e}")
         try:
-            await context.bot.send_message(chat_id=dest_chat_id, text=f"❌ Error: {e}")
+            await context.bot.send_message(chat_id=dest_chat_id, text=f"❌ Scrape error: {e}")
         except Exception:
             pass
         try:
             await context.bot.send_message(chat_id=user_id, text=f"❌ Scrape failed: {e}")
         except Exception:
             pass
-        if "client" in locals():
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
 
     finally:
-        if "client" in locals():
+        if client is not None:
             try:
                 await client.disconnect()
             except Exception:
