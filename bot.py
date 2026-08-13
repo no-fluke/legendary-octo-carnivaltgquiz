@@ -177,7 +177,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     context.user_data.clear()
     await _cleanup_login_state(user_id)
-    await update.message.reply_text("❌ Cancelled.")
+
+    # Cancel any in-flight scrape task belonging to this user
+    scrape_tasks_by_user = context.application.bot_data.get("scrape_tasks_by_user", {})
+    task = scrape_tasks_by_user.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await update.message.reply_text("⛔ Scrape cancelled.")
+    else:
+        await update.message.reply_text("❌ Cancelled.")
 
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -824,8 +836,13 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "I\'ll notify you here when it\'s done.",
         parse_mode=ParseMode.MARKDOWN,
     )
+    user_id = context.user_data.get("scrape_user_id", str(update.effective_user.id))
     task = asyncio.create_task(run_scrape(update, context, dest))
-    # Track it so post_shutdown can cancel it cleanly
+    # Track by user_id so /cancel can find and stop this exact task
+    scrape_tasks_by_user = context.application.bot_data.setdefault("scrape_tasks_by_user", {})
+    scrape_tasks_by_user[user_id] = task
+    task.add_done_callback(lambda t: scrape_tasks_by_user.pop(user_id, None))
+    # Also keep the global set for clean shutdown
     scrape_tasks = context.application.bot_data.setdefault("scrape_tasks", set())
     scrape_tasks.add(task)
     task.add_done_callback(lambda t: scrape_tasks.discard(t))
@@ -1356,9 +1373,21 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
             )
 
     except asyncio.CancelledError:
-        print("  ⚠️  run_scrape cancelled (bot shutting down)")
+        print("  ⚠️  run_scrape cancelled by user or shutdown")
         if pending_image_path:
             await _cleanup_image(pending_image_path)
+        try:
+            await context.bot.send_message(
+                chat_id    = user_id,
+                text       = (
+                    f"⛔ *Scrape stopped\\.*\n\n"
+                    f"🧩 Quizzes sent so far: `{quiz_counter}`\n"
+                    f"📨 Messages fetched: `{total_fetched}`"
+                ),
+                parse_mode = ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            pass
         raise  # let asyncio know it was properly handled
 
     except Exception as e:
