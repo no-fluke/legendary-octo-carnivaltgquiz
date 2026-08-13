@@ -436,13 +436,14 @@ async def _finalize_login(update: Update, client: TelegramClient, user_id: str):
 # /scrape (dest)    → shows saved destinations as buttons to pick from.
 # ================================================================
 
-ADD_DEST_PICK = 10   # conversation state: waiting for channel-pick or button
+ADD_DEST_PICK  = 10   # conversation state: waiting for button presses
+ADD_DEST_TYPED = 11   # conversation state: waiting for user to type a chat ID
 
 _DEST_PREFIX  = "dest:"    # scrape picker: dest:<chat_id>
 _DVIEW_PREFIX = "dview:"   # manage view: tap channel name → detail
 _RDEST_PREFIX = "rdest:"   # remove: rdest:<chat_id>
 _DADD_PREFIX  = "dadd:"    # add: dadd:<chat_id>:<label>  (label url-encoded)
-_DADD_FETCH   = "dadd_fetch"  # button: fetch channels to add
+_DADD_FETCH   = "dadd_fetch"  # button: type a chat ID manually
 
 
 # ---------- DB helpers ----------
@@ -479,7 +480,7 @@ def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
                 callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}",
             )
         ])
-    buttons.append([InlineKeyboardButton("➕ Add channel / group", callback_data=_DADD_FETCH)])
+    buttons.append([InlineKeyboardButton("➕ Add by Chat ID", callback_data=_DADD_FETCH)])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -573,55 +574,19 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ADD_DEST_PICK
 
-    # ── ➕ Add: fetch admin channels via Telethon and show as buttons ──
+    # ── ➕ Add: ask user to type a chat ID or @username ──
     if data == _DADD_FETCH:
-        await query.edit_message_text("⏳ Fetching your channels and groups…")
-        buttons = []
-        try:
-            client = await get_client(user_id)
-            if await client.is_user_authorized():
-                already = {str(d["chat_id"]) for d in await _get_destinations(user_id)}
-                async for dialog in client.iter_dialogs():
-                    entity       = dialog.entity
-                    is_channel   = getattr(entity, "broadcast",  False)
-                    is_megagroup = getattr(entity, "megagroup",  False)
-                    is_gigagroup = getattr(entity, "gigagroup",  False)
-                    if not (is_channel or is_megagroup or is_gigagroup):
-                        continue
-                    creator = getattr(entity, "creator",      False)
-                    admin   = getattr(entity, "admin_rights",  None)
-                    if not (creator or admin):
-                        continue
-                    raw_id   = entity.id
-                    chat_id  = str(int("-100" + str(raw_id))) if (is_channel or is_megagroup) else str(raw_id)
-                    if chat_id in already:
-                        continue   # already saved — skip
-                    title    = (dialog.name or str(raw_id))[:40]
-                    icon     = "📢" if is_channel else "👥"
-                    # Encode label into callback_data (replace : to avoid prefix confusion)
-                    safe_label = title.replace(":", "｜")
-                    cb = f"{_DADD_PREFIX}{chat_id}:{safe_label}"
-                    if len(cb) <= 64:   # Telegram callback_data limit
-                        buttons.append([InlineKeyboardButton(f"{icon} {title}", callback_data=cb)])
-            await client.disconnect()
-        except Exception as e:
-            print(f"  ⚠️  Dialog fetch failed: {e}")
-
-        if buttons:
-            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="dback")])
-            await query.edit_message_text(
-                "➕ *Add destination*\n\nTap a channel or group to save it:",
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            dests = await _get_destinations(user_id)
-            await query.edit_message_text(
-                "ℹ️ No new channels found where you're an admin.",
-                reply_markup=_manage_keyboard(dests),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        return ADD_DEST_PICK
+        await query.edit_message_text(
+            "➕ *Add destination*\n\n"
+            "Send the *channel or group ID* (or @username) you want to add as a destination.\n\n"
+            "Examples:\n"
+            "• `-1001234567890`\n"
+            "• `@mychannelname`\n\n"
+            "The bot will look up the name automatically.\n\n"
+            "Or /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_DEST_TYPED
 
     # ── Tap a channel in the add-list → save it ──
     if data.startswith(_DADD_PREFIX):
@@ -642,6 +607,61 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return ADD_DEST_PICK
+
+
+async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User typed a chat ID or @username — resolve it via Telethon and save."""
+    user_id  = str(update.effective_user.id)
+    raw_text = update.message.text.strip()
+
+    # Normalise: if it looks like a numeric ID without -100, try as-is
+    await update.message.reply_text("🔍 Looking up the chat…")
+
+    try:
+        client = await get_client(user_id)
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            await update.message.reply_text(
+                "❌ You're not logged in. Use /login first, then try /set\\_destination again.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+
+        entity = await client.get_entity(raw_text)
+        await client.disconnect()
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not find that chat: `{e}`\n\n"
+            "Make sure the ID is correct and your account has access to that chat.\n\n"
+            "Send another ID or /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_DEST_TYPED  # let them try again
+
+    # Build the proper -100xxxxxxxxxx chat_id
+    raw_id      = entity.id
+    is_channel  = getattr(entity, "broadcast",  False)
+    is_mega     = getattr(entity, "megagroup",  False)
+    is_giga     = getattr(entity, "gigagroup",  False)
+    if is_channel or is_mega or is_giga:
+        chat_id_str = str(int("-100" + str(raw_id)))
+    else:
+        chat_id_str = str(raw_id)
+
+    title = (getattr(entity, "title", None) or getattr(entity, "username", None) or raw_text)[:40]
+    dests = await _add_destination(user_id, title, chat_id_str)
+
+    text = (
+        "📬 *Destinations*\n\nTap a destination to view or remove it."
+        if dests else
+        "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+    )
+    await update.message.reply_text(
+        f"✅ *{escape_md(title)}* added\\!\n\n" + escape_md(text.split("\n\n", 1)[1]),
+        reply_markup=_manage_keyboard(dests),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return ConversationHandler.END
 
 
 # ---------- Scrape destination picker ----------
@@ -1563,7 +1583,34 @@ def main():
     except Exception as e:
         print(f"⚠️  Could not clear webhook: {e}")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application):
+        await start_ping_server()
+        application.bot_data["ping_task"] = asyncio.create_task(self_ping_loop())
+
+    async def post_shutdown(application):
+        # Cancel the self-ping task so it doesn't linger after the loop stops
+        ping_task = application.bot_data.get("ping_task")
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
+        # Close the DB while the event loop is still running
+        try:
+            await close_db()
+            print("✅ DB closed cleanly.")
+        except Exception as e:
+            print(f"⚠️  DB close error: {e}")
+
+    # Register lifecycle hooks via the builder pattern so PTB actually calls them
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Login
     app.add_handler(ConversationHandler(
@@ -1582,6 +1629,9 @@ def main():
         states={
             ADD_DEST_PICK: [
                 CallbackQueryHandler(manage_dest_callback),
+            ],
+            ADD_DEST_TYPED: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_typed),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1604,26 +1654,6 @@ def main():
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("cancel", cancel))
-
-    async def post_init(application):
-        await start_ping_server()
-        application.bot_data["ping_task"] = asyncio.create_task(self_ping_loop())
-
-    async def post_shutdown(application):
-        # Cancel the self-ping task so it doesn't linger after the loop stops
-        ping_task = application.bot_data.get("ping_task")
-        if ping_task and not ping_task.done():
-            ping_task.cancel()
-            try:
-                await ping_task
-            except asyncio.CancelledError:
-                pass
-        # Close the DB while the event loop is still running
-        await close_db()
-        print("✅ DB closed cleanly.")
-
-    app.post_init     = post_init
-    app.post_shutdown = post_shutdown
 
     print("Bot is running...")
     app.run_polling(
