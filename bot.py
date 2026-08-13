@@ -25,7 +25,14 @@ from telethon.sessions import StringSession
 from telethon.tl.types import (
     MessageMediaPoll, MessageMediaPhoto, MessageMediaDocument
 )
-from telethon.errors import SessionPasswordNeededError, rpcerrorlist
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PhoneNumberInvalidError,
+    PasswordHashInvalidError,
+    rpcerrorlist,
+)
 
 from db import (
     get_user, set_user_field, set_user_fields, close_db,
@@ -158,7 +165,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     context.user_data.clear()
+    await _cleanup_login_state(user_id)
     await update.message.reply_text("❌ Cancelled.")
 
 
@@ -181,128 +190,190 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Not logged in. Use /login to authenticate.")
 
 
+# ---------------- LOGIN STATE (in-memory, like reference code) ----------------
+# Structure: {user_id: {"step": "WAITING_PHONE"|"WAITING_CODE"|"WAITING_PASSWORD", "data": {...}}}
+LOGIN_STATE = {}
+
+
+async def _cleanup_login_state(user_id: str):
+    """Disconnect any live client and remove state."""
+    state = LOGIN_STATE.pop(user_id, None)
+    if state:
+        client = state.get("data", {}).get("client")
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
 # ---------------- LOGIN CONVERSATION --------------------
 
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+
+    # Already logged in?
     user_doc = await get_user(user_id)
-    phone = user_doc.get("phone_number")
-    if phone:
-        await update.message.reply_text(
-            f"Saved phone: `{phone}`\n"
-            "Send a new number or type `yes` to reuse it.\n/cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await update.message.reply_text(
-            "Send your phone in international format, e.g. `+919876543210`.\n/cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    if user_doc.get("session_string"):
+        try:
+            client = await get_client(user_id)
+            if await client.is_user_authorized():
+                await client.disconnect()
+                await update.message.reply_text(
+                    "✅ You are already logged in.\n\nUse /status to check or /cancel to abort."
+                )
+                return ConversationHandler.END
+            await client.disconnect()
+        except Exception:
+            pass
+
+    # Clean up any previous half-finished login
+    await _cleanup_login_state(user_id)
+    LOGIN_STATE[user_id] = {"step": "WAITING_PHONE", "data": {}}
+
+    await update.message.reply_text(
+        "📱 Please send your phone number with country code.\n\n"
+        "Example: `+919876543210`\n\n"
+        "/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN
+    )
     return LOGIN_PHONE
 
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
     user_id = str(update.effective_user.id)
-    user_doc = await get_user(user_id)
-    saved_phone = user_doc.get("phone_number")
+    phone = update.message.text.strip().replace(" ", "")
 
-    if text.lower() == "yes" and saved_phone:
-        phone = saved_phone
-    elif re.match(r"^\+\d+$", text):
-        phone = text
-    else:
-        await update.message.reply_text("❌ Invalid. Use +1234567890 or 'yes'.")
+    if not re.match(r"^\+\d{7,15}$", phone):
+        await update.message.reply_text("❌ Invalid format. Use +1234567890.")
         return LOGIN_PHONE
 
-    client = await get_client(user_id)
+    await update.message.reply_text("📩 Sending OTP...")
 
-    if await client.is_user_authorized():
-        await update.message.reply_text("✅ Already logged in.")
-        await client.disconnect()
-        return ConversationHandler.END
+    # Build a fresh in-memory client (never reuse an old one)
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
 
     try:
         sent = await client.send_code_request(phone)
-        context.user_data["login_client"]    = client
-        context.user_data["login_phone"]     = phone
-        context.user_data["phone_code_hash"] = sent.phone_code_hash
+        # Store everything in LOGIN_STATE — same pattern as reference code
+        LOGIN_STATE[user_id] = {
+            "step": "WAITING_CODE",
+            "data": {
+                "client": client,
+                "phone":  phone,
+                "hash":   sent.phone_code_hash,
+            }
+        }
         await set_user_field(user_id, "phone_number", phone)
-        await update.message.reply_text("📲 OTP sent. Please send the numeric code.")
+        await update.message.reply_text(
+            "📲 OTP sent to your Telegram account.\n\n"
+            "If the code is `12345`, send it as `12345` or `1 2 3 4 5`.\n\n"
+            "/cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return LOGIN_OTP
+
+    except PhoneNumberInvalidError:
+        await client.disconnect()
+        del LOGIN_STATE[user_id]
+        await update.message.reply_text("❌ Phone number is invalid. Try again.")
+        return LOGIN_PHONE
     except Exception as e:
         await client.disconnect()
-        await update.message.reply_text(f"❌ Failed to send OTP: {e}")
+        del LOGIN_STATE[user_id]
+        await update.message.reply_text(f"❌ Failed to send OTP: {e}\n\nTry /login again.")
         return ConversationHandler.END
 
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    otp = update.message.text.strip()
     user_id = str(update.effective_user.id)
+    otp = update.message.text.strip().replace(" ", "")
+
     if not otp.isdigit():
-        await update.message.reply_text("❌ Send a numeric OTP.")
+        await update.message.reply_text("❌ Send only the numeric code.")
         return LOGIN_OTP
 
-    phone = context.user_data.get("login_phone")
+    state = LOGIN_STATE.get(user_id)
+    if not state or state["step"] != "WAITING_CODE":
+        await update.message.reply_text("❌ Session lost. Please /login again.")
+        return ConversationHandler.END
 
-    # Client may have died (Render sleep, restart, etc.) — rebuild and re-request code
-    client = context.user_data.get("login_client")
-    if not client or not client.is_connected():
-        if not phone:
-            await update.message.reply_text("❌ Session lost. Please /login again.")
-            return ConversationHandler.END
-        try:
-            client = await get_client(user_id)
-            sent = await client.send_code_request(phone)
-            context.user_data["login_client"]    = client
-            context.user_data["phone_code_hash"] = sent.phone_code_hash
-            await update.message.reply_text(
-                "⚠️ Previous session expired — a fresh OTP has been sent. Please enter the new code."
-            )
-            return LOGIN_OTP
-        except Exception as e:
-            await update.message.reply_text(f"❌ Could not re-send OTP: {e}. Try /login again.")
-            return ConversationHandler.END
+    client       = state["data"]["client"]
+    phone        = state["data"]["phone"]
+    phone_hash   = state["data"]["hash"]
 
     try:
-        await client.sign_in(
-            phone,
-            otp,
-            phone_code_hash=context.user_data.get("phone_code_hash")
-        )
-        me = await client.get_me()
-        await save_session(user_id, client)
-        await client.disconnect()
-        context.user_data.pop("login_client", None)
-        await update.message.reply_text(f"✅ Logged in as {me.first_name} (@{me.username})\nSession saved to MongoDB.")
+        await client.sign_in(phone, otp, phone_code_hash=phone_hash)
+        await _finalize_login(update, client, user_id)
         return ConversationHandler.END
+
+    except PhoneCodeInvalidError:
+        await update.message.reply_text("❌ OTP is incorrect. Try again.")
+        return LOGIN_OTP  # Let them retry — don't clear state
+
+    except PhoneCodeExpiredError:
+        await client.disconnect()
+        del LOGIN_STATE[user_id]
+        await update.message.reply_text("❌ OTP expired. Please /login again.")
+        return ConversationHandler.END
+
     except SessionPasswordNeededError:
-        await update.message.reply_text("🔐 2FA enabled. Send your 2FA password.")
+        LOGIN_STATE[user_id]["step"] = "WAITING_PASSWORD"
+        await update.message.reply_text(
+            "🔐 Two-step verification enabled.\nPlease send your 2FA password.\n\n/cancel to abort."
+        )
         return LOGIN_2FA
+
     except Exception as e:
-        await update.message.reply_text(f"❌ OTP error: {e}. Try again or /cancel.")
-        return LOGIN_OTP
+        await client.disconnect()
+        del LOGIN_STATE[user_id]
+        await update.message.reply_text(f"❌ Error: {e}\n\nPlease /login again.")
+        return ConversationHandler.END
 
 
 async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id  = str(update.effective_user.id)
     password = update.message.text.strip()
-    user_id = str(update.effective_user.id)
-    client = context.user_data.get("login_client")
-    if not client:
-        await update.message.reply_text("❌ Session expired. /login again.")
+
+    state = LOGIN_STATE.get(user_id)
+    if not state or state["step"] != "WAITING_PASSWORD":
+        await update.message.reply_text("❌ Session lost. Please /login again.")
         return ConversationHandler.END
+
+    client = state["data"]["client"]
 
     try:
         await client.sign_in(password=password)
+        await _finalize_login(update, client, user_id)
+        return ConversationHandler.END
+
+    except PasswordHashInvalidError:
+        await update.message.reply_text("❌ Wrong password. Try again.")
+        return LOGIN_2FA
+
+    except Exception as e:
+        await client.disconnect()
+        del LOGIN_STATE[user_id]
+        await update.message.reply_text(f"❌ 2FA error: {e}\n\nPlease /login again.")
+        return ConversationHandler.END
+
+
+async def _finalize_login(update: Update, client: TelegramClient, user_id: str):
+    """Save session and clean up — mirrors reference code's finalize_login."""
+    try:
         me = await client.get_me()
         await save_session(user_id, client)
         await client.disconnect()
-        context.user_data.pop("login_client", None)
-        await update.message.reply_text(f"✅ Logged in as {me.first_name} (@{me.username})\nSession saved to MongoDB.")
-        return ConversationHandler.END
+        LOGIN_STATE.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ Logged in as {me.first_name} (@{me.username})\n"
+            "Session saved to MongoDB.\n\n"
+            "If you ever get an auth error, /cancel and /login again."
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ 2FA error: {e}. Try again or /cancel.")
-        return LOGIN_2FA
+        LOGIN_STATE.pop(user_id, None)
+        await update.message.reply_text(f"❌ Error finalizing login: {e}")
 
 
 # ---------------- CHANNEL MANAGEMENT --------------------
