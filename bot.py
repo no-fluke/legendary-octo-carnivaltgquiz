@@ -824,7 +824,11 @@ async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "I\'ll notify you here when it\'s done.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    asyncio.create_task(run_scrape(update, context, dest))
+    task = asyncio.create_task(run_scrape(update, context, dest))
+    # Track it so post_shutdown can cancel it cleanly
+    scrape_tasks = context.application.bot_data.setdefault("scrape_tasks", set())
+    scrape_tasks.add(task)
+    task.add_done_callback(lambda t: scrape_tasks.discard(t))
     return ConversationHandler.END
 
 # ---------------- SCRAPE CONVERSATION --------------------
@@ -1319,15 +1323,37 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
                 parse_mode = ParseMode.MARKDOWN_V2,
             )
 
+    except asyncio.CancelledError:
+        print("  ⚠️  run_scrape cancelled (bot shutting down)")
+        if "client" in locals():
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        raise  # let asyncio know it was properly handled
+
     except Exception as e:
-        await context.bot.send_message(chat_id=dest_chat_id, text=f"❌ Error: {e}")
-        # Also notify the user's bot chat on failure
+        print(f"  ❌  run_scrape error: {e}")
+        try:
+            await context.bot.send_message(chat_id=dest_chat_id, text=f"❌ Error: {e}")
+        except Exception:
+            pass
         try:
             await context.bot.send_message(chat_id=user_id, text=f"❌ Scrape failed: {e}")
         except Exception:
             pass
         if "client" in locals():
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    finally:
+        if "client" in locals():
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 # ================== POLL HELPERS =================
@@ -1735,7 +1761,7 @@ def main():
         application.bot_data["ping_task"] = asyncio.create_task(self_ping_loop())
 
     async def post_shutdown(application):
-        # Cancel the self-ping task so it doesn't linger after the loop stops
+        # Cancel the self-ping task
         ping_task = application.bot_data.get("ping_task")
         if ping_task and not ping_task.done():
             ping_task.cancel()
@@ -1743,6 +1769,16 @@ def main():
                 await ping_task
             except asyncio.CancelledError:
                 pass
+
+        # Cancel all in-flight scrape tasks cleanly
+        scrape_tasks = application.bot_data.get("scrape_tasks", set())
+        if scrape_tasks:
+            print(f"⏳ Cancelling {len(scrape_tasks)} in-flight scrape task(s)…")
+            for t in list(scrape_tasks):
+                t.cancel()
+            await asyncio.gather(*scrape_tasks, return_exceptions=True)
+            print("✅ Scrape tasks cancelled.")
+
         # Close the DB while the event loop is still running
         try:
             await close_db()
