@@ -153,19 +153,29 @@ def build_bot_caption(quiz: dict, number: int) -> str:
 # =================== BOT COMMANDS ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    first_name = user.first_name if user and user.first_name else "there"
     await update.message.reply_text(
-        "🤖 *Quiz Scraper Bot*\n\n"
-        "Commands:\n"
-        "• /login — log in with your Telegram account\n"
-        "• /logout — log out and revoke session\n"
-        "• /status — show login status\n"
-        "• /scrape — scrape quizzes from a channel range\n"
+        f"👋 *Welcome, {first_name}\\!*\n\n"
+        "I'm your *Quiz Scraper Bot* — I can scrape quizzes and polls from private Telegram channels "
+        "and re\\-send them to any chat of your choice\\.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔐 *Account*\n"
+        "• /login — connect your Telegram account\n"
+        "• /logout — revoke your session\n"
+        "• /status — check login status\n\n"
+        "📡 *Channels*\n"
         "• /addchannel — save a private channel\n"
-        "• /channels — list your saved channels\n"
-        "• /removechannel — remove a saved channel\n"
-        "• /set\\_destination — where to send results\n"
-        "• /cancel — cancel current operation",
-        parse_mode=ParseMode.MARKDOWN
+        "• /channels — list saved channels\n"
+        "• /removechannel — remove a channel\n\n"
+        "🚀 *Scraping*\n"
+        "• /scrape — scrape quizzes from a message range\n"
+        "• /set\\_destination — set where results are sent\n\n"
+        "⚙️ *Other*\n"
+        "• /cancel — cancel any ongoing operation\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "👉 Start by using /login to connect your account\\.",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
 
 
@@ -411,25 +421,96 @@ async def _finalize_login(update: Update, client: TelegramClient, user_id: str):
 # ---------------- CHANNEL MANAGEMENT --------------------
 
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Entry point for /addchannel.
+    Shows an inline button to start the flow, plus an option to add via bot chat (user ID).
+    """
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Paste a channel link", callback_data="addch_link")],
+        [InlineKeyboardButton("🤖 Use bot chat (my user ID)", callback_data="addch_userid")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="addch_cancel")],
+    ])
     await update.message.reply_text(
         "📡 *Add a Channel*\n\n"
-        "Paste any message link from the private channel you want to save.\n"
-        "Format: `https://t.me/c/1234567890/42`\n\n"
-        "I'll resolve the channel name automatically.\n/cancel to abort.",
-        parse_mode=ParseMode.MARKDOWN
+        "How would you like to add the channel?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
     )
     return ADD_CHANNEL_INPUT
 
 
+# Callback query handler for the add-channel button menu
+ADD_CHANNEL_BUTTON = 8   # new state for button interactions
+
+
+async def add_channel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the inline button choices in the add-channel flow."""
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    data = query.data
+
+    if data == "addch_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    if data == "addch_userid":
+        # Save current user's ID as a "channel" (for bot chat use)
+        existing = await get_channel(user_id, int(user_id))
+        if existing:
+            await query.edit_message_text(
+                f"ℹ️ Your bot chat is already saved as *{existing['title']}*.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+        await add_channel(user_id, int(user_id), f"🤖 My Bot Chat ({user_id})", link="")
+        await query.edit_message_text(
+            f"✅ *Bot chat saved!*\n\n"
+            f"Your user ID `{user_id}` has been added as a destination channel.\n"
+            "You can now select it when scraping.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    if data == "addch_link":
+        await query.edit_message_text(
+            "📎 *Paste a channel message link*\n\n"
+            "Format: `https://t.me/c/1234567890/42`\n\n"
+            "You can paste *multiple links* one by one — send /done when finished, or /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        context.user_data["addch_added"] = []
+        return ADD_CHANNEL_INPUT
+
+    return ADD_CHANNEL_INPUT
+
+
 async def add_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles text input for the add-channel flow.
+    Supports adding multiple channels one by one — /done to finish.
+    """
     user_id = str(update.effective_user.id)
     text = update.message.text.strip()
+
+    if text.lower() in ("/done", "done"):
+        added = context.user_data.get("addch_added", [])
+        if added:
+            summary = "\n".join(f"• *{escape_md(t)}*" for t in added)
+            await update.message.reply_text(
+                f"✅ *All done\\!* Added {len(added)} channel\\(s\\):\n{summary}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        else:
+            await update.message.reply_text("ℹ️ No channels were added.")
+        context.user_data.pop("addch_added", None)
+        return ConversationHandler.END
 
     parsed = parse_private_link(text)
     if not parsed:
         await update.message.reply_text(
-            "❌ Could not parse that link. Paste a valid `t.me/c/...` link or /cancel.",
-            parse_mode=ParseMode.MARKDOWN
+            "❌ Could not parse that link\\. Paste a valid `t\\.me/c/\\.\\.\\.` link, /done to finish, or /cancel\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
         return ADD_CHANNEL_INPUT
 
@@ -439,12 +520,13 @@ async def add_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = await get_channel(user_id, channel_id)
     if existing:
         await update.message.reply_text(
-            f"ℹ️ Channel already saved as *{existing['title']}*.",
-            parse_mode=ParseMode.MARKDOWN
+            f"ℹ️ Channel already saved as *{escape_md(existing['title'])}*\\.\n"
+            "Send another link or /done to finish\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
-        return ConversationHandler.END
+        return ADD_CHANNEL_INPUT
 
-    # Try to resolve the channel name via Telethon
+    # Resolve channel name via Telethon
     user_doc = await get_user(user_id)
     if not user_doc.get("session_string"):
         await update.message.reply_text(
@@ -463,16 +545,21 @@ async def add_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Could not access channel: {e}\nMake sure you're a member."
+            f"❌ Could not access channel: {e}\nMake sure you're a member.\n\nSend another link or /done to finish."
         )
-        return ConversationHandler.END
+        return ADD_CHANNEL_INPUT
 
     await add_channel(user_id, channel_id, title, link=text)
+
+    if "addch_added" not in context.user_data:
+        context.user_data["addch_added"] = []
+    context.user_data["addch_added"].append(title)
+
     await update.message.reply_text(
-        f"✅ Channel *{title}* saved!\n`channel_id: {channel_id}`",
-        parse_mode=ParseMode.MARKDOWN
+        f"✅ *{escape_md(title)}* saved\\!\n\n"
+        "Send another channel link to add more, or /done to finish\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
-    return ConversationHandler.END
 
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1035,8 +1122,37 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
 
         await client.disconnect()
 
+        # ── Completion notification ──────────────────────────────────────────
+        done_text = (
+            "✅ *Scrape complete\\!*\n\n"
+            f"📡 Channel: `{escape_md(title)}`\n"
+            f"📨 Messages fetched: `{total_fetched}`\n"
+            f"🧩 Quizzes scraped: `{len(quizzes)}`\n"
+            f"📝 Text messages: `{len(text_msgs)}`\n"
+            f"🗳️ Auto\\-voted: `{auto_voted_n}`\n\n"
+            f"📬 Results sent to: `{escape_md(str(dest_chat_id))}`"
+        )
+        # Always notify the user in their bot DM (even if dest is a different chat)
+        await context.bot.send_message(
+            chat_id    = user_id,
+            text       = done_text,
+            parse_mode = ParseMode.MARKDOWN_V2,
+        )
+        # If the destination is a different chat, also send a brief done notice there
+        if str(dest_chat_id) != str(user_id):
+            await context.bot.send_message(
+                chat_id    = dest_chat_id,
+                text       = f"✅ *Done\\! {len(quizzes)} quiz\\(es\\) and {len(text_msgs)} text message\\(s\\) delivered\\.*",
+                parse_mode = ParseMode.MARKDOWN_V2,
+            )
+
     except Exception as e:
         await context.bot.send_message(chat_id=dest_chat_id, text=f"❌ Error: {e}")
+        # Also notify the user's bot chat on failure
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"❌ Scrape failed: {e}")
+        except Exception:
+            pass
         if "client" in locals():
             await client.disconnect()
 
@@ -1454,13 +1570,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
-    # Add channel
+    # Add channel — button-driven, supports multiple channels and bot-chat (user ID)
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addchannel", add_channel_start)],
         states={
-            ADD_CHANNEL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_input)],
+            ADD_CHANNEL_INPUT: [
+                CallbackQueryHandler(add_channel_button, pattern=r"^addch_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_input),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("done", lambda u, c: ConversationHandler.END)],
     ))
 
     # Remove channel
