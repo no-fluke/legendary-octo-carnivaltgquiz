@@ -156,9 +156,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     first_name = user.first_name if user and user.first_name else "there"
     await update.message.reply_text(
-        f"👋 *Welcome, {first_name}\\!*\n\n"
+        f"👋 *Welcome, {first_name}!*\n\n"
         "I'm your *Quiz Scraper Bot* — I can scrape quizzes and polls from private Telegram channels "
-        "and re\\-send them to any chat of your choice\\.\n\n"
+        "and re-send them to any chat of your choice.\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "🔐 *Account*\n"
         "• /login — connect your Telegram account\n"
@@ -174,8 +174,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Other*\n"
         "• /cancel — cancel any ongoing operation\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "👉 Start by using /login to connect your account\\.",
-        parse_mode=ParseMode.MARKDOWN_V2
+        "👉 Start by using /login to connect your account.",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 
