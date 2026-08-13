@@ -426,31 +426,34 @@ async def _finalize_login(update: Update, client: TelegramClient, user_id: str):
 # ================================================================
 # DESTINATION MANAGEMENT
 #
-# Destinations are stored in MongoDB as a list under the key
-# "destinations":  [{"label": "My Channel", "chat_id": -100123}, ...]
+# Destinations stored in MongoDB as:
+#   "destinations": [{"label": "My Channel", "chat_id": "-100123"}, ...]
 #
-# /set_destination  → manage (view / add / remove) saved destinations
-# /scrape Step 3    → pick one of the saved destinations (or enter ad-hoc)
+# /set_destination  → shows saved destinations as buttons.
+#                     Tap a destination → detail view with Remove button.
+#                     Tap ➕ → bot fetches your admin channels via Telethon
+#                               and shows them as buttons to add.
+# /scrape (dest)    → shows saved destinations as buttons to pick from.
 # ================================================================
 
-ADD_DEST_NAME, ADD_DEST_ID = range(10, 12)   # extra conversation states
+ADD_DEST_PICK = 10   # conversation state: waiting for channel-pick or button
 
-_DEST_PREFIX   = "dest:"     # callback: dest:<chat_id>   — pick a destination
-_RDEST_PREFIX  = "rdest:"    # callback: rdest:<chat_id>  — remove a destination
+_DEST_PREFIX  = "dest:"    # scrape picker: dest:<chat_id>
+_DVIEW_PREFIX = "dview:"   # manage view: tap channel name → detail
+_RDEST_PREFIX = "rdest:"   # remove: rdest:<chat_id>
+_DADD_PREFIX  = "dadd:"    # add: dadd:<chat_id>:<label>  (label url-encoded)
+_DADD_FETCH   = "dadd_fetch"  # button: fetch channels to add
 
 
 # ---------- DB helpers ----------
 
 async def _get_destinations(user_id: str) -> list[dict]:
-    """Return the user's saved destinations list (may be empty)."""
     user_doc = await get_user(user_id)
     return user_doc.get("destinations", [])
 
 
 async def _add_destination(user_id: str, label: str, chat_id) -> list[dict]:
-    """Add a destination if not already present; return updated list."""
     dests = await _get_destinations(user_id)
-    # Avoid duplicates by chat_id
     if not any(str(d["chat_id"]) == str(chat_id) for d in dests):
         dests.append({"label": label, "chat_id": str(chat_id)})
         await set_user_field(user_id, "destinations", dests)
@@ -458,7 +461,6 @@ async def _add_destination(user_id: str, label: str, chat_id) -> list[dict]:
 
 
 async def _remove_destination(user_id: str, chat_id) -> list[dict]:
-    """Remove a destination by chat_id; return updated list."""
     dests = await _get_destinations(user_id)
     dests = [d for d in dests if str(d["chat_id"]) != str(chat_id)]
     await set_user_field(user_id, "destinations", dests)
@@ -468,36 +470,37 @@ async def _remove_destination(user_id: str, chat_id) -> list[dict]:
 # ---------- Keyboard builders ----------
 
 def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
-    """
-    Keyboard shown by /set_destination:
-    • One row per saved destination with a 🗑 remove button
-    • ➕ Add destination
-    """
+    """Main manage view: each destination as a tappable button + ➕ Add."""
     buttons = []
     for d in dests:
-        label   = d["label"]
-        chat_id = d["chat_id"]
         buttons.append([
-            InlineKeyboardButton(f"🗑 {label}", callback_data=f"{_RDEST_PREFIX}{chat_id}"),
+            InlineKeyboardButton(
+                f"📢 {d['label']}",
+                callback_data=f"{_DVIEW_PREFIX}{d['chat_id']}",
+            )
         ])
-    buttons.append([InlineKeyboardButton("➕ Add destination", callback_data="dest_add")])
+    buttons.append([InlineKeyboardButton("➕ Add channel / group", callback_data=_DADD_FETCH)])
     return InlineKeyboardMarkup(buttons)
 
 
+def _detail_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    """Detail view for one destination: Remove + Back."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Remove", callback_data=f"{_RDEST_PREFIX}{chat_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="dback")],
+    ])
+
+
 def _pick_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
-    """
-    Keyboard shown in scrape Step 3:
-    • One button per saved destination to pick it
-    • ✏️ Enter manually (ad-hoc, not saved)
-    """
+    """Scrape destination picker: one button per saved destination."""
     buttons = []
     for d in dests:
-        label   = d["label"]
-        chat_id = d["chat_id"]
         buttons.append([
-            InlineKeyboardButton(f"📢 {label}", callback_data=f"{_DEST_PREFIX}{chat_id}"),
+            InlineKeyboardButton(
+                f"📢 {d['label']}",
+                callback_data=f"{_DEST_PREFIX}{d['chat_id']}",
+            )
         ])
-    buttons.append([InlineKeyboardButton("✏️ Enter manually", callback_data=f"{_DEST_PREFIX}manual")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -506,121 +509,167 @@ def _pick_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
 async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     dests   = await _get_destinations(user_id)
-
-    if dests:
-        lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
-        text  = f"📬 *Saved Destinations*\n\n{lines}\n\nTap 🗑 to remove, or ➕ to add a new one."
-    else:
-        text  = "📬 *Saved Destinations*\n\nNo destinations saved yet.\n\nTap ➕ to add one."
-
+    text    = (
+        "📬 *Destinations*\n\nTap a destination to view or remove it."
+        if dests else
+        "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+    )
     await update.message.reply_text(
         text,
         reply_markup=_manage_keyboard(dests),
         parse_mode=ParseMode.MARKDOWN,
     )
-    return ADD_DEST_NAME   # conversation now waits for button presses or text
+    return ADD_DEST_PICK
 
 
 async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles 🗑 remove button and ➕ add button from the manage view."""
+    """Handles all button presses inside the /set_destination conversation."""
     query   = update.callback_query
     await query.answer()
     user_id = str(update.effective_user.id)
     data    = query.data
 
-    # ─── Remove ───
+    # ── Tap a saved destination → show detail with Remove + Back ──
+    if data.startswith(_DVIEW_PREFIX):
+        chat_id = data[len(_DVIEW_PREFIX):]
+        dests   = await _get_destinations(user_id)
+        entry   = next((d for d in dests if str(d["chat_id"]) == chat_id), None)
+        label   = entry["label"] if entry else chat_id
+        await query.edit_message_text(
+            f"📢 *{escape_md(label)}*\n`{chat_id}`",
+            reply_markup=_detail_keyboard(chat_id),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return ADD_DEST_PICK
+
+    # ── Remove button on detail view ──
     if data.startswith(_RDEST_PREFIX):
         chat_id = data[len(_RDEST_PREFIX):]
         dests   = await _remove_destination(user_id, chat_id)
-        if dests:
-            lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
-            text  = f"✅ *Removed.*\n\n📬 *Saved Destinations*\n\n{lines}\n\nTap 🗑 to remove, or ➕ to add."
-        else:
-            text  = "✅ *Removed.*\n\n📬 *Saved Destinations*\n\nNo destinations saved yet.\n\nTap ➕ to add one."
-        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests), parse_mode=ParseMode.MARKDOWN)
-        return ADD_DEST_NAME   # stay in conversation
-
-    # ─── Add ───
-    if data == "dest_add":
+        text    = (
+            "📬 *Destinations*\n\nTap a destination to view or remove it."
+            if dests else
+            "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+        )
         await query.edit_message_text(
-            "➕ *Add Destination — Step 1 of 2*\n\n"
-            "Send a *name* for this destination (e.g. `My Quiz Channel`).\n\n"
-            "Or /cancel to abort.",
+            text,
+            reply_markup=_manage_keyboard(dests),
             parse_mode=ParseMode.MARKDOWN,
         )
-        return ADD_DEST_NAME   # next text message → add_dest_name
+        return ADD_DEST_PICK
+
+    # ── Back button on detail view ──
+    if data == "dback":
+        dests = await _get_destinations(user_id)
+        text  = (
+            "📬 *Destinations*\n\nTap a destination to view or remove it."
+            if dests else
+            "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=_manage_keyboard(dests),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_DEST_PICK
+
+    # ── ➕ Add: fetch admin channels via Telethon and show as buttons ──
+    if data == _DADD_FETCH:
+        await query.edit_message_text("⏳ Fetching your channels and groups…")
+        buttons = []
+        try:
+            client = await get_client(user_id)
+            if await client.is_user_authorized():
+                already = {str(d["chat_id"]) for d in await _get_destinations(user_id)}
+                async for dialog in client.iter_dialogs():
+                    entity       = dialog.entity
+                    is_channel   = getattr(entity, "broadcast",  False)
+                    is_megagroup = getattr(entity, "megagroup",  False)
+                    is_gigagroup = getattr(entity, "gigagroup",  False)
+                    if not (is_channel or is_megagroup or is_gigagroup):
+                        continue
+                    creator = getattr(entity, "creator",      False)
+                    admin   = getattr(entity, "admin_rights",  None)
+                    if not (creator or admin):
+                        continue
+                    raw_id   = entity.id
+                    chat_id  = str(int("-100" + str(raw_id))) if (is_channel or is_megagroup) else str(raw_id)
+                    if chat_id in already:
+                        continue   # already saved — skip
+                    title    = (dialog.name or str(raw_id))[:40]
+                    icon     = "📢" if is_channel else "👥"
+                    # Encode label into callback_data (replace : to avoid prefix confusion)
+                    safe_label = title.replace(":", "｜")
+                    cb = f"{_DADD_PREFIX}{chat_id}:{safe_label}"
+                    if len(cb) <= 64:   # Telegram callback_data limit
+                        buttons.append([InlineKeyboardButton(f"{icon} {title}", callback_data=cb)])
+            await client.disconnect()
+        except Exception as e:
+            print(f"  ⚠️  Dialog fetch failed: {e}")
+
+        if buttons:
+            buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="dback")])
+            await query.edit_message_text(
+                "➕ *Add destination*\n\nTap a channel or group to save it:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            dests = await _get_destinations(user_id)
+            await query.edit_message_text(
+                "ℹ️ No new channels found where you're an admin.",
+                reply_markup=_manage_keyboard(dests),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return ADD_DEST_PICK
+
+    # ── Tap a channel in the add-list → save it ──
+    if data.startswith(_DADD_PREFIX):
+        payload   = data[len(_DADD_PREFIX):]
+        # chat_id is everything before the first ':', label is the rest
+        colon     = payload.index(":")
+        chat_id   = payload[:colon]
+        label     = payload[colon + 1:].replace("｜", ":")
+        dests     = await _add_destination(user_id, label, chat_id)
+        text      = (
+            "📬 *Destinations*\n\nTap a destination to view or remove it."
+            if dests else
+            "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+        )
+        await query.edit_message_text(
+            f"✅ *{escape_md(label)}* added\\!\n\n" + escape_md(text.split("\n\n", 1)[1]),
+            reply_markup=_manage_keyboard(dests),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return ADD_DEST_PICK
 
 
-async def add_dest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: receive the label."""
-    context.user_data["new_dest_label"] = update.message.text.strip()
-    await update.message.reply_text(
-        "➕ *Add Destination — Step 2 of 2*\n\n"
-        "Now send the *chat ID or @username*:\n\n"
-        "• `@mychannel` — public channel/group\n"
-        "• `-1001234567890` — private channel ID\n"
-        "• A number you forwarded from the channel\n\n"
-        "Or /cancel to abort.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ADD_DEST_ID
-
-
-async def add_dest_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: receive the chat ID / username and save."""
-    user_id = str(update.effective_user.id)
-    text    = update.message.text.strip()
-    label   = context.user_data.get("new_dest_label", text)
-
-    if re.match(r"^-?\d+$", text):
-        chat_id = int(text)
-    else:
-        chat_id = text if text.startswith("@") else f"@{text}"
-
-    dests = await _add_destination(user_id, label, chat_id)
-    lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
-    await update.message.reply_text(
-        f"✅ *Destination saved!*\n\n📬 *Saved Destinations*\n\n{lines}\n\n"
-        "Tap 🗑 to remove, or ➕ to add another.",
-        reply_markup=_manage_keyboard(dests),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ADD_DEST_NAME   # stay so they can keep managing
-
-
-# ---------- Scrape Step-3 picker ----------
+# ---------- Scrape destination picker ----------
 
 async def _show_scrape_dest_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                    prompt: str, user_id: str) -> None:
-    dests    = await _get_destinations(user_id)
-    keyboard = _pick_keyboard(dests)
-    target   = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(prompt, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+                                    user_id: str) -> None:
+    dests  = await _get_destinations(user_id)
+    target = update.message
+    if not dests:
+        await target.reply_text(
+            "⚠️ *No destinations saved.*\n\nUse /set\\_destination to add a channel or group first, then try /scrape again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await target.reply_text(
+        "📬 *Where should the results be sent?*\n\nPick a destination:",
+        reply_markup=_pick_keyboard(dests),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles dest:* buttons in the scrape Step-3 picker.
-    dest:manual → ask for text input
-    dest:<chat_id> → kick off scrape
-    """
+    """Handles dest:* buttons in the scrape destination picker."""
     query   = update.callback_query
     await query.answer()
-    user_id = str(update.effective_user.id)
     payload = query.data[len(_DEST_PREFIX):]
 
-    if payload == "manual":
-        await query.edit_message_text(
-            "✏️ *Enter destination:*\n\n"
-            "• `@username` — public channel / group\n"
-            "• `-1001234567890` — private chat ID\n"
-            "• `me` — this bot chat\n\n"
-            "Or /cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return SCRAPE_DEST   # next text → scrape_dest handler
-
-    # Resolve label from button text
+    # Recover label from button text
     label = payload
     if query.message and query.message.reply_markup:
         for row in query.message.reply_markup.inline_keyboard:
@@ -629,11 +678,11 @@ async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     label = btn.text
                     break
 
-    dest = int(payload) if re.match(r"^-?\d+$", payload) else payload
-
+    dest  = int(payload) if re.match(r"^-?\d+$", payload) else payload
     total = context.user_data['end_id'] - context.user_data['start_id'] + 1
+
     await query.edit_message_text(
-        f"✅ *Destination:* {label}\n\n"
+        f"✅ *Sending to:* {label}\n\n"
         "⏳ *Scrape started!*\n\n"
         f"📡 Channel: `{context.user_data['channel_id']}`\n"
         f"📨 Range: `{context.user_data['start_id']}` → `{context.user_data['end_id']}` ({total} messages)\n\n"
@@ -675,8 +724,8 @@ async def scrape_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["scrape_user_id"] = user_id
     await update.message.reply_text(
-        "🚀 *Start Scraping*\n\n"
-        "Step 1 of 3 — Paste the *start message link* (the first quiz in the range).\n\n"
+        "🚀 *Scrape*\n\n"
+        "Paste the *start message link* (first quiz in the range).\n\n"
         "📎 Example:\n`https://t.me/c/1234567890/42`\n\n"
         "Or /cancel to abort.",
         parse_mode=ParseMode.MARKDOWN
@@ -698,11 +747,11 @@ async def scrape_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["channel_id"] = parsed[0]
     context.user_data["start_id"]   = parsed[1]
     await update.message.reply_text(
-        f"✅ *Start message set!* (ID: `{parsed[1]}`)\n\n"
-        "Step 2 of 3 — Now paste the *end message link* (the last quiz in the range).\n\n"
+        f"✅ Start set \\(ID: `{parsed[1]}`\\)\n\n"
+        "Now paste the *end message link* \\(last quiz in the range\\)\\.\n\n"
         "📎 Example:\n`https://t.me/c/1234567890/99`\n\n"
-        "Or /cancel to abort.",
-        parse_mode=ParseMode.MARKDOWN
+        "Or /cancel to abort\\.",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
     return SCRAPE_END_LINK
 
@@ -742,42 +791,11 @@ async def scrape_end_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["end_id"] = end_id
     user_id = context.user_data["scrape_user_id"]
-
-    prompt = (
-        f"✅ *Range set!* Messages `{start_id}` → `{end_id}` ({end_id - start_id + 1} messages)\n\n"
-        "Step 3 of 3 — *Where should results be sent?*\n\n"
-        "Pick a saved destination or enter manually:"
-    )
-    await _show_scrape_dest_picker(update, context, prompt, user_id)
+    await _show_scrape_dest_picker(update, context, user_id)
     return SCRAPE_DEST
 
 
-async def scrape_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Manual text fallback for scrape Step 3 — reached when user taps
-    '✏️ Enter manually' then types a destination.
-    """
-    user_id = context.user_data["scrape_user_id"]
-    text    = update.message.text.strip()
 
-    if text.lower() == "me":
-        dest = update.effective_user.id
-    elif re.match(r"^-?\d+$", text):
-        dest = int(text)
-    else:
-        dest = text if text.startswith("@") else f"@{text}"
-
-    total = context.user_data['end_id'] - context.user_data['start_id'] + 1
-    await update.message.reply_text(
-        "⏳ *Scrape started!*\n\n"
-        f"📡 Channel: `{context.user_data['channel_id']}`\n"
-        f"📨 Range: `{context.user_data['start_id']}` → `{context.user_data['end_id']}` ({total} messages)\n"
-        f"📬 Destination: `{dest}`\n\n"
-        "This may take a while — I'll notify you here when it's done.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    asyncio.create_task(run_scrape(update, context, dest))
-    return ConversationHandler.END
 
 
 # ==================== FORMAT HELPERS (from polls3108) ===================
@@ -1562,12 +1580,8 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_destination", set_destination)],
         states={
-            ADD_DEST_NAME: [
-                CallbackQueryHandler(manage_dest_callback, pattern=f"^({_RDEST_PREFIX}|dest_add)"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_name),
-            ],
-            ADD_DEST_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_id),
+            ADD_DEST_PICK: [
+                CallbackQueryHandler(manage_dest_callback),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1581,7 +1595,6 @@ def main():
             SCRAPE_END_LINK:   [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_end_link)],
             SCRAPE_DEST: [
                 CallbackQueryHandler(scrape_dest_callback, pattern=f"^{_DEST_PREFIX}"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_dest),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
