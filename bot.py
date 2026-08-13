@@ -423,166 +423,224 @@ async def _finalize_login(update: Update, client: TelegramClient, user_id: str):
 
 
 
-# ---------------- DESTINATION PICKER HELPERS --------------------
+# ================================================================
+# DESTINATION MANAGEMENT
+#
+# Destinations are stored in MongoDB as a list under the key
+# "destinations":  [{"label": "My Channel", "chat_id": -100123}, ...]
+#
+# /set_destination  → manage (view / add / remove) saved destinations
+# /scrape Step 3    → pick one of the saved destinations (or enter ad-hoc)
+# ================================================================
 
-# Callback-data prefix for destination buttons
-_DEST_PREFIX = "dest:"
+ADD_DEST_NAME, ADD_DEST_ID = range(10, 12)   # extra conversation states
 
-async def _build_dest_keyboard(user_id: str, include_me: bool = True) -> InlineKeyboardMarkup:
+_DEST_PREFIX   = "dest:"     # callback: dest:<chat_id>   — pick a destination
+_RDEST_PREFIX  = "rdest:"    # callback: rdest:<chat_id>  — remove a destination
+
+
+# ---------- DB helpers ----------
+
+async def _get_destinations(user_id: str) -> list[dict]:
+    """Return the user's saved destinations list (may be empty)."""
+    user_doc = await get_user(user_id)
+    return user_doc.get("destinations", [])
+
+
+async def _add_destination(user_id: str, label: str, chat_id) -> list[dict]:
+    """Add a destination if not already present; return updated list."""
+    dests = await _get_destinations(user_id)
+    # Avoid duplicates by chat_id
+    if not any(str(d["chat_id"]) == str(chat_id) for d in dests):
+        dests.append({"label": label, "chat_id": str(chat_id)})
+        await set_user_field(user_id, "destinations", dests)
+    return dests
+
+
+async def _remove_destination(user_id: str, chat_id) -> list[dict]:
+    """Remove a destination by chat_id; return updated list."""
+    dests = await _get_destinations(user_id)
+    dests = [d for d in dests if str(d["chat_id"]) != str(chat_id)]
+    await set_user_field(user_id, "destinations", dests)
+    return dests
+
+
+# ---------- Keyboard builders ----------
+
+def _manage_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
     """
-    Build an inline keyboard with one button per channel/group the user
-    has admin access to (fetched via Telethon), plus a 'Me (this chat)'
-    button and a 'Enter manually' escape hatch.
-    Returns a plain keyboard with just the two fallback buttons if Telethon fails.
+    Keyboard shown by /set_destination:
+    • One row per saved destination with a 🗑 remove button
+    • ➕ Add destination
     """
-    buttons: list[list[InlineKeyboardButton]] = []
+    buttons = []
+    for d in dests:
+        label   = d["label"]
+        chat_id = d["chat_id"]
+        buttons.append([
+            InlineKeyboardButton(f"🗑 {label}", callback_data=f"{_RDEST_PREFIX}{chat_id}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Add destination", callback_data="dest_add")])
+    return InlineKeyboardMarkup(buttons)
 
-    if include_me:
-        buttons.append([InlineKeyboardButton("📩 Me (this chat)", callback_data=f"{_DEST_PREFIX}me")])
 
-    try:
-        client = await get_client(user_id)
-        if await client.is_user_authorized():
-            async for dialog in client.iter_dialogs():
-                entity = dialog.entity
-                # Only channels/megagroups where the user is creator/admin
-                is_channel   = getattr(entity, "broadcast",   False)
-                is_megagroup = getattr(entity, "megagroup",   False)
-                is_group     = getattr(entity, "gigagroup",   False)
-                if not (is_channel or is_megagroup or is_group):
-                    continue
-                creator = getattr(entity, "creator",         False)
-                admin   = getattr(entity, "admin_rights",    None)
-                if not (creator or admin):
-                    continue
-                title    = dialog.name or str(entity.id)
-                chat_id  = entity.id
-                # Telegram channel IDs need the -100 prefix for Bot API
-                if is_channel or is_megagroup:
-                    chat_id = int("-100" + str(entity.id))
-                icon = "📢" if is_channel else "👥"
-                buttons.append([InlineKeyboardButton(
-                    f"{icon} {title}",
-                    callback_data=f"{_DEST_PREFIX}{chat_id}"
-                )])
-        await client.disconnect()
-    except Exception as e:
-        print(f"  ⚠️  Could not fetch dialogs for dest picker: {e}")
-
+def _pick_keyboard(dests: list[dict]) -> InlineKeyboardMarkup:
+    """
+    Keyboard shown in scrape Step 3:
+    • One button per saved destination to pick it
+    • ✏️ Enter manually (ad-hoc, not saved)
+    """
+    buttons = []
+    for d in dests:
+        label   = d["label"]
+        chat_id = d["chat_id"]
+        buttons.append([
+            InlineKeyboardButton(f"📢 {label}", callback_data=f"{_DEST_PREFIX}{chat_id}"),
+        ])
     buttons.append([InlineKeyboardButton("✏️ Enter manually", callback_data=f"{_DEST_PREFIX}manual")])
     return InlineKeyboardMarkup(buttons)
 
 
-async def _show_dest_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                             prompt: str, user_id: str) -> None:
-    """Send the destination picker message with inline keyboard."""
-    keyboard = await _build_dest_keyboard(user_id)
-    target = update.callback_query.message if update.callback_query else update.message
+# ---------- /set_destination — manage saved destinations ----------
+
+async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    dests   = await _get_destinations(user_id)
+
+    if dests:
+        lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
+        text  = f"📬 *Saved Destinations*\n\n{lines}\n\nTap 🗑 to remove, or ➕ to add a new one."
+    else:
+        text  = "📬 *Saved Destinations*\n\nNo destinations saved yet.\n\nTap ➕ to add one."
+
+    await update.message.reply_text(
+        text,
+        reply_markup=_manage_keyboard(dests),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADD_DEST_NAME   # conversation now waits for button presses or text
+
+
+async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles 🗑 remove button and ➕ add button from the manage view."""
+    query   = update.callback_query
+    await query.answer()
+    user_id = str(update.effective_user.id)
+    data    = query.data
+
+    # ─── Remove ───
+    if data.startswith(_RDEST_PREFIX):
+        chat_id = data[len(_RDEST_PREFIX):]
+        dests   = await _remove_destination(user_id, chat_id)
+        if dests:
+            lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
+            text  = f"✅ *Removed.*\n\n📬 *Saved Destinations*\n\n{lines}\n\nTap 🗑 to remove, or ➕ to add."
+        else:
+            text  = "✅ *Removed.*\n\n📬 *Saved Destinations*\n\nNo destinations saved yet.\n\nTap ➕ to add one."
+        await query.edit_message_text(text, reply_markup=_manage_keyboard(dests), parse_mode=ParseMode.MARKDOWN)
+        return ADD_DEST_NAME   # stay in conversation
+
+    # ─── Add ───
+    if data == "dest_add":
+        await query.edit_message_text(
+            "➕ *Add Destination — Step 1 of 2*\n\n"
+            "Send a *name* for this destination (e.g. `My Quiz Channel`).\n\n"
+            "Or /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_DEST_NAME   # next text message → add_dest_name
+
+
+async def add_dest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: receive the label."""
+    context.user_data["new_dest_label"] = update.message.text.strip()
+    await update.message.reply_text(
+        "➕ *Add Destination — Step 2 of 2*\n\n"
+        "Now send the *chat ID or @username*:\n\n"
+        "• `@mychannel` — public channel/group\n"
+        "• `-1001234567890` — private channel ID\n"
+        "• A number you forwarded from the channel\n\n"
+        "Or /cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADD_DEST_ID
+
+
+async def add_dest_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: receive the chat ID / username and save."""
+    user_id = str(update.effective_user.id)
+    text    = update.message.text.strip()
+    label   = context.user_data.get("new_dest_label", text)
+
+    if re.match(r"^-?\d+$", text):
+        chat_id = int(text)
+    else:
+        chat_id = text if text.startswith("@") else f"@{text}"
+
+    dests = await _add_destination(user_id, label, chat_id)
+    lines = "\n".join(f"• {d['label']} (`{d['chat_id']}`)" for d in dests)
+    await update.message.reply_text(
+        f"✅ *Destination saved!*\n\n📬 *Saved Destinations*\n\n{lines}\n\n"
+        "Tap 🗑 to remove, or ➕ to add another.",
+        reply_markup=_manage_keyboard(dests),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADD_DEST_NAME   # stay so they can keep managing
+
+
+# ---------- Scrape Step-3 picker ----------
+
+async def _show_scrape_dest_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    prompt: str, user_id: str) -> None:
+    dests    = await _get_destinations(user_id)
+    keyboard = _pick_keyboard(dests)
+    target   = update.callback_query.message if update.callback_query else update.message
     await target.reply_text(prompt, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
 
-# --------- Callback handler for destination buttons ---------
-
-async def dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles all dest:* callback_data.
-    Works for both /set_destination flow and the scrape Step-3 flow.
-    The flow context is stored in context.user_data["dest_flow"]:
-      "set"   → came from /set_destination
-      "scrape" → came from /scrape Step 3
+    Handles dest:* buttons in the scrape Step-3 picker.
+    dest:manual → ask for text input
+    dest:<chat_id> → kick off scrape
     """
-    query    = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    user_id  = str(update.effective_user.id)
-    data     = query.data  # e.g. "dest:me" / "dest:-100123" / "dest:manual"
-    payload  = data[len(_DEST_PREFIX):]
-
-    flow = context.user_data.get("dest_flow", "set")
+    user_id = str(update.effective_user.id)
+    payload = query.data[len(_DEST_PREFIX):]
 
     if payload == "manual":
         await query.edit_message_text(
-            "✏️ *Enter destination manually:*\n\n"
-            "• `me` — this bot chat\n"
+            "✏️ *Enter destination:*\n\n"
             "• `@username` — public channel / group\n"
-            "• `-1001234567890` — private chat ID\n\n"
+            "• `-1001234567890` — private chat ID\n"
+            "• `me` — this bot chat\n\n"
             "Or /cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
-        context.user_data["dest_awaiting_manual"] = True
-        # Stay in same conversation state so the next text message hits dest_input / scrape_dest
-        return
+        return SCRAPE_DEST   # next text → scrape_dest handler
 
-    # Resolve destination value
-    if payload == "me":
-        dest = update.effective_user.id
-        label = "Me (this chat)"
-    else:
-        dest  = int(payload)
-        # Try to recover a nice label from the button text
-        label = str(dest)
-        if query.message and query.message.reply_markup:
-            for row in query.message.reply_markup.inline_keyboard:
-                for btn in row:
-                    if btn.callback_data == data:
-                        label = btn.text
-                        break
+    # Resolve label from button text
+    label = payload
+    if query.message and query.message.reply_markup:
+        for row in query.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == query.data:
+                    label = btn.text
+                    break
 
-    await set_user_field(user_id, "destination", dest)
+    dest = int(payload) if re.match(r"^-?\d+$", payload) else payload
 
-    if flow == "scrape":
-        # Finish the scrape conversation
-        await query.edit_message_text(
-            f"✅ *Destination set to:* {label}\n\n"
-            "⏳ Starting scrape…",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        asyncio.create_task(run_scrape(update, context, dest))
-        # End the conversation — we do this by storing END signal
-        # (the ConversationHandler sees the callback, not a new state)
-        context.user_data["_dest_done"] = True
-    else:
-        await query.edit_message_text(
-            f"✅ *Destination saved!*\n\nResults will be sent to: {label}\n\n"
-            "Use /set\\_destination anytime to change it.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-
-# ---------------- SET DESTINATION --------------------
-
-async def set_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = str(update.effective_user.id)
-    user_doc = await get_user(user_id)
-    current  = user_doc.get("destination")
-    context.user_data["dest_flow"] = "set"
-
-    prompt = (
-        "📬 *Set Destination*\n\n"
-        + (f"Current: `{current}`\n\n" if current else "")
-        + "Pick a channel/group below, or choose *Me* to receive results here:"
+    total = context.user_data['end_id'] - context.user_data['start_id'] + 1
+    await query.edit_message_text(
+        f"✅ *Destination:* {label}\n\n"
+        "⏳ *Scrape started!*\n\n"
+        f"📡 Channel: `{context.user_data['channel_id']}`\n"
+        f"📨 Range: `{context.user_data['start_id']}` → `{context.user_data['end_id']}` ({total} messages)\n\n"
+        "I'll notify you here when it's done.",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await _show_dest_picker(update, context, prompt, user_id)
-    return SCRAPE_DEST
-
-
-async def dest_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles the manual-text fallback when the user typed a destination
-    instead of using the inline keyboard buttons.
-    """
-    user_id = str(update.effective_user.id)
-    text    = update.message.text.strip()
-    if text.lower() == "me":
-        dest = update.effective_user.id
-    elif re.match(r"^-?\d+$", text):
-        dest = int(text)
-    else:
-        dest = text if text.startswith("@") else f"@{text}"
-    await set_user_field(user_id, "destination", dest)
-    await update.message.reply_text(
-        f"✅ *Destination saved!*\n\nResults will be sent to `{dest}`.\n\nUse /set\\_destination anytime to change it.",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    asyncio.create_task(run_scrape(update, context, dest))
     return ConversationHandler.END
 
 
@@ -682,42 +740,33 @@ async def scrape_end_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return SCRAPE_END_LINK
 
-    context.user_data["end_id"]   = end_id
-    context.user_data["dest_flow"] = "scrape"
-
-    user_id  = context.user_data["scrape_user_id"]
-    user_doc = await get_user(user_id)
-    saved    = user_doc.get("destination")
+    context.user_data["end_id"] = end_id
+    user_id = context.user_data["scrape_user_id"]
 
     prompt = (
         f"✅ *Range set!* Messages `{start_id}` → `{end_id}` ({end_id - start_id + 1} messages)\n\n"
-        "Step 3 of 3 — *Where should results be sent?*\n"
-        + (f"\n💾 Saved destination: `{saved}`\n" if saved else "")
-        + "\nPick a channel below:"
+        "Step 3 of 3 — *Where should results be sent?*\n\n"
+        "Pick a saved destination or enter manually:"
     )
-    await _show_dest_picker(update, context, prompt, user_id)
+    await _show_scrape_dest_picker(update, context, prompt, user_id)
     return SCRAPE_DEST
 
 
 async def scrape_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Text fallback for the scrape destination step — only reached when the
-    user ignores the inline keyboard and types manually.
+    Manual text fallback for scrape Step 3 — reached when user taps
+    '✏️ Enter manually' then types a destination.
     """
-    user_id  = context.user_data["scrape_user_id"]
-    user_doc = await get_user(user_id)
-    text     = update.message.text.strip()
+    user_id = context.user_data["scrape_user_id"]
+    text    = update.message.text.strip()
 
-    if text.lower() == "skip":
-        dest = user_doc.get("destination", update.effective_user.id)
-    elif text.lower() == "me":
+    if text.lower() == "me":
         dest = update.effective_user.id
     elif re.match(r"^-?\d+$", text):
         dest = int(text)
     else:
         dest = text if text.startswith("@") else f"@{text}"
 
-    await set_user_field(user_id, "destination", dest)
     total = context.user_data['end_id'] - context.user_data['start_id'] + 1
     await update.message.reply_text(
         "⏳ *Scrape started!*\n\n"
@@ -725,7 +774,7 @@ async def scrape_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📨 Range: `{context.user_data['start_id']}` → `{context.user_data['end_id']}` ({total} messages)\n"
         f"📬 Destination: `{dest}`\n\n"
         "This may take a while — I'll notify you here when it's done.",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN,
     )
     asyncio.create_task(run_scrape(update, context, dest))
     return ConversationHandler.END
@@ -1509,13 +1558,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
-    # Set destination
+    # Manage saved destinations
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_destination", set_destination)],
         states={
-            SCRAPE_DEST: [
-                CallbackQueryHandler(dest_callback, pattern=f"^{_DEST_PREFIX}"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dest_input),
+            ADD_DEST_NAME: [
+                CallbackQueryHandler(manage_dest_callback, pattern=f"^({_RDEST_PREFIX}|dest_add)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_name),
+            ],
+            ADD_DEST_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_id),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1528,7 +1580,7 @@ def main():
             SCRAPE_START_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_start_link)],
             SCRAPE_END_LINK:   [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_end_link)],
             SCRAPE_DEST: [
-                CallbackQueryHandler(dest_callback, pattern=f"^{_DEST_PREFIX}"),
+                CallbackQueryHandler(scrape_dest_callback, pattern=f"^{_DEST_PREFIX}"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_dest),
             ],
         },
