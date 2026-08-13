@@ -35,6 +35,7 @@ from telethon.errors import (
 )
 
 from db import (
+    add_channel, remove_channel, get_channels,
     get_user, set_user_field, set_user_fields, close_db,
     save_job, get_job, clear_job,
 )
@@ -446,26 +447,24 @@ _DADD_PREFIX  = "dadd:"    # add: dadd:<chat_id>:<label>  (label url-encoded)
 _DADD_FETCH   = "dadd_fetch"  # button: type a chat ID manually
 
 
-# ---------- DB helpers ----------
+# ---------- DB helpers (backed by MongoDB channels collection) ----------
 
 async def _get_destinations(user_id: str) -> list[dict]:
-    user_doc = await get_user(user_id)
-    return user_doc.get("destinations", [])
+    """Return saved destinations as list of {label, chat_id} dicts."""
+    channels = await get_channels(user_id)
+    return [{"label": ch["title"], "chat_id": str(ch["channel_id"])} for ch in channels]
 
 
 async def _add_destination(user_id: str, label: str, chat_id) -> list[dict]:
-    dests = await _get_destinations(user_id)
-    if not any(str(d["chat_id"]) == str(chat_id) for d in dests):
-        dests.append({"label": label, "chat_id": str(chat_id)})
-        await set_user_field(user_id, "destinations", dests)
-    return dests
+    """Save a destination to MongoDB channels collection."""
+    await add_channel(user_id, int(chat_id), label)
+    return await _get_destinations(user_id)
 
 
 async def _remove_destination(user_id: str, chat_id) -> list[dict]:
-    dests = await _get_destinations(user_id)
-    dests = [d for d in dests if str(d["chat_id"]) != str(chat_id)]
-    await set_user_field(user_id, "destinations", dests)
-    return dests
+    """Remove a destination from MongoDB channels collection."""
+    await remove_channel(user_id, int(chat_id))
+    return await _get_destinations(user_id)
 
 
 # ---------- Keyboard builders ----------
@@ -783,7 +782,7 @@ async def _show_scrape_dest_picker(update: Update, context: ContextTypes.DEFAULT
 
 async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles dest:* buttons in the scrape destination picker."""
-    query   = update.callback_query
+    query = update.callback_query
     await query.answer()
     payload = query.data[len(_DEST_PREFIX):]
 
@@ -796,14 +795,27 @@ async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     label = btn.text
                     break
 
+    # Guard: scrape context may be missing if bot restarted mid-conversation
+    start_id   = context.user_data.get("start_id")
+    end_id     = context.user_data.get("end_id")
+    channel_id = context.user_data.get("channel_id")
+
+    if start_id is None or end_id is None or channel_id is None:
+        await query.edit_message_text(
+            "❌ *Session lost* — the bot may have restarted.\n\n"
+            "Please run /scrape again to start over.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
     dest  = int(payload) if re.match(r"^-?\d+$", payload) else payload
-    total = context.user_data['end_id'] - context.user_data['start_id'] + 1
+    total = end_id - start_id + 1
 
     await query.edit_message_text(
         f"✅ *Sending to:* {label}\n\n"
         "⏳ *Scrape started!*\n\n"
-        f"📡 Channel: `{context.user_data['channel_id']}`\n"
-        f"📨 Range: `{context.user_data['start_id']}` → `{context.user_data['end_id']}` ({total} messages)\n\n"
+        f"📡 Channel: `{channel_id}`\n"
+        f"📨 Range: `{start_id}` → `{end_id}` ({total} messages)\n\n"
         "I'll notify you here when it's done.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -997,8 +1009,9 @@ async def send_via_bot(bot, items: list, title: str, chat_id, recreate_polls: bo
     """
     quizzes   = [x for x in items if x["type"] == "quiz"]
     text_msgs = [x for x in items if x["type"] == "text"]
+    documents = [x for x in items if x["type"] == "document"]
     print(f"\n  🤖  Bot sending {len(items)} item(s) in original order "
-          f"({len(quizzes)} quiz, {len(text_msgs)} text)...\n")
+          f"({len(quizzes)} quiz, {len(text_msgs)} text, {len(documents)} docs)...\n")
 
     try:
         await bot.send_message(
@@ -1064,6 +1077,21 @@ async def send_via_bot(bot, items: list, title: str, chat_id, recreate_polls: bo
                     await bot.send_message(chat_id=chat_id, text=plain)
                 except Exception as e2:
                     print(f"  ❌  Fallback failed: {e2}")
+            await asyncio.sleep(SEND_DELAY)
+
+        elif item["type"] == "document":
+            # Forward PDF / non-image document with a note
+            caption = item.get("text", "").strip()
+            mime    = item.get("mime", "")
+            label   = "📄 PDF" if "pdf" in mime else "📎 Document"
+            note    = f"{label} (msg #{item['message_id']})"
+            if caption:
+                note += f"\n{caption}"
+            try:
+                await bot.send_message(chat_id=chat_id, text=note)
+                print(f"  📄  Sent document notice for msg #{item['message_id']}")
+            except Exception as e:
+                print(f"  ❌  Document notice failed: {e}")
             await asyncio.sleep(SEND_DELAY)
 
     print("\n  ✅  All done.")
@@ -1178,13 +1206,30 @@ async def run_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, dest_ch
                     poll_data["type"] = "quiz"
                     items.append(poll_data)
 
-                # Image-only messages
+                # Image-only messages (photos or image documents — skip PDFs/other docs)
                 elif isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)):
+                    doc  = getattr(message.media, "document", None)
+                    mime = getattr(doc, "mime_type", "") if doc else ""
+                    is_image = (
+                        isinstance(message.media, MessageMediaPhoto)
+                        or (mime and mime.startswith("image/"))
+                    )
+                    if not is_image:
+                        # PDF or other non-image document — queue it for forwarding
+                        print(f"  📄  Non-image doc at msg {message.id} (mime={mime or 'unknown'}) — queuing as document")
+                        items.append({
+                            "type":       "document",
+                            "message_id": message.id,
+                            "date":       message.date.isoformat(),
+                            "text":       message.text or "",
+                            "mime":       mime,
+                        })
+                        continue
                     image_path = await download_image(client, message, message.id)
                     if image_path:
                         pending_image_path    = image_path
                         pending_image_caption = message.text or ""
-                        print(f"      🖼️  Stored image from msg {message.id} with caption: \"{pending_image_caption[:50]}\"")
+                        print(f'      🖼️  Stored image from msg {message.id} with caption: "{pending_image_caption[:50]}"')
 
         # Summary
         quizzes   = [x for x in items if x["type"] == "quiz"]
