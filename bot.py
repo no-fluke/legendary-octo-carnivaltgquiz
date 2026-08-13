@@ -578,11 +578,11 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == _DADD_FETCH:
         await query.edit_message_text(
             "➕ *Add destination*\n\n"
-            "Send the *channel or group ID* (or @username) you want to add as a destination.\n\n"
-            "Examples:\n"
+            "You can add a destination in *two ways*:\n\n"
+            "1️⃣ *Forward any message* from the channel/group to this chat — the bot will detect it automatically.\n\n"
+            "2️⃣ *Type the ID or @username* manually:\n"
             "• `-1001234567890`\n"
             "• `@mychannelname`\n\n"
-            "The bot will look up the name automatically.\n\n"
             "Or /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -610,45 +610,139 @@ async def manage_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User typed a chat ID or @username — resolve it via Telethon and save."""
-    user_id  = str(update.effective_user.id)
-    raw_text = update.message.text.strip()
+    """User typed a chat ID/@username OR forwarded a message — resolve and save."""
+    user_id = str(update.effective_user.id)
+    msg     = update.message
 
-    # Normalise: if it looks like a numeric ID without -100, try as-is
-    await update.message.reply_text("🔍 Looking up the chat…")
+    # ── Check for a forwarded message first ──
+    fwd = msg.forward_origin if hasattr(msg, "forward_origin") else None
+    # PTB v20+: forward_origin; also support legacy forward_from_chat
+    fwd_chat = None
+    if fwd is not None:
+        # MessageOriginChannel / MessageOriginChat have .chat attribute
+        fwd_chat = getattr(fwd, "chat", None)
+    if fwd_chat is None:
+        # Legacy fallback
+        fwd_chat = getattr(msg, "forward_from_chat", None)
 
-    try:
-        client = await get_client(user_id)
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            await update.message.reply_text(
-                "❌ You're not logged in. Use /login first, then try /set\\_destination again.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return ConversationHandler.END
+    if fwd_chat is not None:
+        # We have a clean entity straight from the forwarded message
+        raw_id     = fwd_chat.id
+        chat_type  = fwd_chat.type  # 'channel', 'supergroup', 'group', 'private'
+        if chat_type in ("channel", "supergroup"):
+            chat_id_str = str(int("-100" + str(raw_id)))
+        else:
+            chat_id_str = str(raw_id)
+        title = (getattr(fwd_chat, "title", None) or getattr(fwd_chat, "username", None) or chat_id_str)[:40]
 
-        entity = await client.get_entity(raw_text)
-        await client.disconnect()
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Could not find that chat: `{e}`\n\n"
-            "Make sure the ID is correct and your account has access to that chat.\n\n"
-            "Send another ID or /cancel to abort.",
+        dests = await _add_destination(user_id, title, chat_id_str)
+        text = (
+            "📬 *Destinations*\n\nTap a destination to view or remove it."
+            if dests else
+            "📬 *Destinations*\n\nNo destinations saved yet. Tap ➕ to add one."
+        )
+        await msg.reply_text(
+            f"✅ *{escape_md(title)}* added\\!\n`{chat_id_str}`\n\n" + escape_md(text.split("\n\n", 1)[1]),
+            reply_markup=_manage_keyboard(dests),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return ConversationHandler.END
+
+    # ── No forward — fall back to typed ID / @username ──
+    raw_text = (msg.text or "").strip()
+    if not raw_text:
+        await msg.reply_text(
+            "❌ Please forward a message from the channel, or type its ID / @username.",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return ADD_DEST_TYPED  # let them try again
+        return ADD_DEST_TYPED
 
-    # Build the proper -100xxxxxxxxxx chat_id
-    raw_id      = entity.id
-    is_channel  = getattr(entity, "broadcast",  False)
-    is_mega     = getattr(entity, "megagroup",  False)
-    is_giga     = getattr(entity, "gigagroup",  False)
-    if is_channel or is_mega or is_giga:
-        chat_id_str = str(int("-100" + str(raw_id)))
+    await msg.reply_text("🔍 Looking up the chat…")
+
+    client = await get_client(user_id)
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        await update.message.reply_text(
+            "❌ You're not logged in. Use /login first, then try /set\\_destination again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    entity = None
+    chat_id_str = None
+    title = None
+
+    # ── Strategy 1: try get_entity (works for @usernames and cached IDs) ──
+    try:
+        entity = await client.get_entity(raw_text)
+    except Exception:
+        pass
+
+    # ── Strategy 2: numeric ID — try InputPeerChannel / InputPeerChat ──
+    if entity is None:
+        numeric = raw_text.lstrip("-")
+        # Strip -100 prefix to get bare channel id
+        if numeric.startswith("100") and len(numeric) > 10:
+            bare_id = int(numeric[3:])
+        else:
+            bare_id = int(numeric) if numeric.isdigit() else None
+
+        if bare_id is not None:
+            from telethon.tl.types import InputPeerChannel, InputPeerChat
+            # Try as a channel/supergroup first (most common for -100... IDs)
+            try:
+                from telethon.tl.functions.channels import GetFullChannelRequest
+                peer = InputPeerChannel(channel_id=bare_id, access_hash=0)
+                entity = await client.get_entity(peer)
+            except Exception:
+                pass
+
+            # Try iterating dialogs to find the entity (slower but reliable)
+            if entity is None:
+                try:
+                    target_id = int(raw_text)  # the full -100xxx number
+                    async for dialog in client.iter_dialogs():
+                        if dialog.id == target_id:
+                            entity = dialog.entity
+                            break
+                except Exception:
+                    pass
+
+    await client.disconnect()
+
+    # ── If still not found, save it as-is using the raw ID the user typed ──
+    if entity is None:
+        # Accept the ID directly if it looks like a valid Telegram chat ID
+        stripped = raw_text.lstrip("-")
+        if stripped.isdigit():
+            chat_id_str = raw_text  # trust what the user typed
+            title = raw_text[:40]
+            await update.message.reply_text(
+                f"⚠️ Could not auto-resolve the chat name (your account may not have joined it yet), "
+                f"but the ID `{raw_text}` looks valid and has been saved.\n\n"
+                "If sending fails later, make sure your account is a member of that chat.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Could not find that chat: `{raw_text}`\n\n"
+                "Make sure the ID is correct and your account has access to that chat.\n\n"
+                "Send another ID or /cancel to abort.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ADD_DEST_TYPED
     else:
-        chat_id_str = str(raw_id)
+        # Build the proper -100xxxxxxxxxx chat_id from the resolved entity
+        raw_id     = entity.id
+        is_channel = getattr(entity, "broadcast", False)
+        is_mega    = getattr(entity, "megagroup",  False)
+        is_giga    = getattr(entity, "gigagroup",  False)
+        if is_channel or is_mega or is_giga:
+            chat_id_str = str(int("-100" + str(raw_id)))
+        else:
+            chat_id_str = str(raw_id)
+        title = (getattr(entity, "title", None) or getattr(entity, "username", None) or raw_text)[:40]
 
-    title = (getattr(entity, "title", None) or getattr(entity, "username", None) or raw_text)[:40]
     dests = await _add_destination(user_id, title, chat_id_str)
 
     text = (
@@ -1631,7 +1725,11 @@ def main():
                 CallbackQueryHandler(manage_dest_callback),
             ],
             ADD_DEST_TYPED: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dest_typed),
+                # Accept forwarded messages OR typed text (ID / @username)
+                MessageHandler(
+                    (filters.TEXT & ~filters.COMMAND) | filters.FORWARDED,
+                    add_dest_typed,
+                ),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
