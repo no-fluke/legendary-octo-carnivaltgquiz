@@ -237,6 +237,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     otp = update.message.text.strip()
+    user_id = str(update.effective_user.id)
     if not otp.isdigit():
         await update.message.reply_text("❌ Send a numeric OTP.")
         return LOGIN_OTP
@@ -264,6 +265,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
+    user_id = str(update.effective_user.id)
     client = context.user_data.get("login_client")
     if not client:
         await update.message.reply_text("❌ Session expired. /login again.")
