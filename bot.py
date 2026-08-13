@@ -223,9 +223,10 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        await client.send_code_request(phone)
-        context.user_data["login_client"] = client
-        context.user_data["login_phone"]  = phone
+        sent = await client.send_code_request(phone)
+        context.user_data["login_client"]    = client
+        context.user_data["login_phone"]     = phone
+        context.user_data["phone_code_hash"] = sent.phone_code_hash
         await set_user_field(user_id, "phone_number", phone)
         await update.message.reply_text("📲 OTP sent. Please send the numeric code.")
         return LOGIN_OTP
@@ -242,13 +243,33 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Send a numeric OTP.")
         return LOGIN_OTP
 
+    phone = context.user_data.get("login_phone")
+
+    # Client may have died (Render sleep, restart, etc.) — rebuild and re-request code
     client = context.user_data.get("login_client")
-    if not client:
-        await update.message.reply_text("❌ Session expired. /login again.")
-        return ConversationHandler.END
+    if not client or not client.is_connected():
+        if not phone:
+            await update.message.reply_text("❌ Session lost. Please /login again.")
+            return ConversationHandler.END
+        try:
+            client = await get_client(user_id)
+            sent = await client.send_code_request(phone)
+            context.user_data["login_client"]    = client
+            context.user_data["phone_code_hash"] = sent.phone_code_hash
+            await update.message.reply_text(
+                "⚠️ Previous session expired — a fresh OTP has been sent. Please enter the new code."
+            )
+            return LOGIN_OTP
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not re-send OTP: {e}. Try /login again.")
+            return ConversationHandler.END
 
     try:
-        await client.sign_in(context.user_data["login_phone"], otp)
+        await client.sign_in(
+            phone,
+            otp,
+            phone_code_hash=context.user_data.get("phone_code_hash")
+        )
         me = await client.get_me()
         await save_session(user_id, client)
         await client.disconnect()
@@ -1011,6 +1032,19 @@ async def self_ping_loop():
 # ======================== MAIN ============================
 
 def main():
+    import httpx
+
+    # Drop any existing webhook/session so we don't conflict with a lingering instance
+    try:
+        httpx.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": True},
+            timeout=10,
+        )
+        print("✅ Webhook cleared.")
+    except Exception as e:
+        print(f"⚠️  Could not clear webhook: {e}")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Login
@@ -1078,7 +1112,12 @@ def main():
 
     print("Bot is running...")
     try:
-        app.run_polling()
+        app.run_polling(
+            drop_pending_updates=True,   # ignore stale updates from previous instance
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Exception as e:
+        print(f"Fatal error: {e}")
     finally:
         import asyncio as _asyncio
         _asyncio.get_event_loop().run_until_complete(close_db())
