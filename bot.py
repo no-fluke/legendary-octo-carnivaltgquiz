@@ -626,11 +626,15 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fwd_chat = getattr(msg, "forward_from_chat", None)
 
     if fwd_chat is not None:
-        # We have a clean entity straight from the forwarded message
-        raw_id     = fwd_chat.id
-        chat_type  = fwd_chat.type  # 'channel', 'supergroup', 'group', 'private'
+        # We have a clean entity straight from the forwarded message.
+        # PTB already gives the full signed ID (e.g. -1004460564772) so
+        # we must NOT prepend -100 again — just use it as-is.
+        raw_id    = fwd_chat.id
+        chat_type = fwd_chat.type  # 'channel', 'supergroup', 'group', 'private'
         if chat_type in ("channel", "supergroup"):
-            chat_id_str = str(int("-100" + str(raw_id)))
+            abs_str = str(abs(raw_id))
+            # Ensure it carries the -100 prefix exactly once
+            chat_id_str = "-" + (abs_str if abs_str.startswith("100") else "100" + abs_str)
         else:
             chat_id_str = str(raw_id)
         title = (getattr(fwd_chat, "title", None) or getattr(fwd_chat, "username", None) or chat_id_str)[:40]
