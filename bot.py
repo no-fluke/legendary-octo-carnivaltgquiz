@@ -1607,21 +1607,29 @@ def main():
 
     async def post_init(application):
         await start_ping_server()
-        asyncio.create_task(self_ping_loop())
+        application.bot_data["ping_task"] = asyncio.create_task(self_ping_loop())
 
-    app.post_init = post_init
+    async def post_shutdown(application):
+        # Cancel the self-ping task so it doesn't linger after the loop stops
+        ping_task = application.bot_data.get("ping_task")
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
+        # Close the DB while the event loop is still running
+        await close_db()
+        print("✅ DB closed cleanly.")
+
+    app.post_init     = post_init
+    app.post_shutdown = post_shutdown
 
     print("Bot is running...")
-    try:
-        app.run_polling(
-            drop_pending_updates=True,   # ignore stale updates from previous instance
-            allowed_updates=Update.ALL_TYPES,
-        )
-    except Exception as e:
-        print(f"Fatal error: {e}")
-    finally:
-        import asyncio as _asyncio
-        _asyncio.get_event_loop().run_until_complete(close_db())
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
