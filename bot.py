@@ -764,64 +764,68 @@ async def add_dest_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Scrape destination picker ----------
 
 async def _show_scrape_dest_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                    user_id: str) -> None:
+                                    user_id: str) -> bool:
+    """Show numbered list of destinations. Returns False if none saved."""
     dests  = await _get_destinations(user_id)
     target = update.message
-    if not dests:
-        await target.reply_text(
-            "⚠️ *No destinations saved.*\n\nUse /set\\_destination to add a channel or group first, then try /scrape again.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+
+    # Always prepend "This chat" (bot private chat with the user) as option 1
+    bot_chat = {"label": "🤖 This chat (bot)", "chat_id": str(update.effective_user.id)}
+    full_list = [bot_chat] + list(dests)
+
+    # Store full list in user_data so scrape_dest_number can read it
+    context.user_data["dest_list"] = full_list
+
+    lines = ["📬 *Where should the results be sent?*", ""]
+    for i, d in enumerate(full_list, 1):
+        lines.append(f"*{i}.* {d['label']}  (`{d['chat_id']}`)")
+    lines += ["", "Reply with the *number* of your choice, or /cancel to abort."]
+
     await target.reply_text(
-        "📬 *Where should the results be sent?*\n\nPick a destination:",
-        reply_markup=_pick_keyboard(dests),
+        "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
     )
+    return True
 
 
-async def scrape_dest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles dest:* buttons in the scrape destination picker."""
-    query = update.callback_query
-    await query.answer()
-    payload = query.data[len(_DEST_PREFIX):]
+async def scrape_dest_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User replied with a number to pick a destination."""
+    raw   = update.message.text.strip()
+    dests = context.user_data.get("dest_list", [])
 
-    # Recover label from button text
-    label = payload
-    if query.message and query.message.reply_markup:
-        for row in query.message.reply_markup.inline_keyboard:
-            for btn in row:
-                if btn.callback_data == query.data:
-                    label = btn.text
-                    break
-
-    # Guard: scrape context may be missing if bot restarted mid-conversation
     start_id   = context.user_data.get("start_id")
     end_id     = context.user_data.get("end_id")
     channel_id = context.user_data.get("channel_id")
 
     if start_id is None or end_id is None or channel_id is None:
-        await query.edit_message_text(
-            "❌ *Session lost* — the bot may have restarted.\n\n"
-            "Please run /scrape again to start over.",
+        await update.message.reply_text(
+            "❌ *Session lost* — the bot may have restarted.\n\nPlease run /scrape again to start over.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
 
-    dest  = int(payload) if re.match(r"^-?\d+$", payload) else payload
-    total = end_id - start_id + 1
+    if not raw.isdigit() or not (1 <= int(raw) <= len(dests)):
+        await update.message.reply_text(
+            f"❌ Please reply with a number between *1* and *{len(dests)}*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return SCRAPE_DEST
 
-    await query.edit_message_text(
+    chosen = dests[int(raw) - 1]
+    label  = chosen["label"]
+    dest   = int(chosen["chat_id"])
+    total  = end_id - start_id + 1
+
+    await update.message.reply_text(
         f"✅ *Sending to:* {label}\n\n"
         "⏳ *Scrape started!*\n\n"
         f"📡 Channel: `{channel_id}`\n"
         f"📨 Range: `{start_id}` → `{end_id}` ({total} messages)\n\n"
-        "I'll notify you here when it's done.",
+        "I\'ll notify you here when it\'s done.",
         parse_mode=ParseMode.MARKDOWN,
     )
     asyncio.create_task(run_scrape(update, context, dest))
     return ConversationHandler.END
-
 
 # ---------------- SCRAPE CONVERSATION --------------------
 
@@ -1790,9 +1794,7 @@ def main():
         states={
             SCRAPE_START_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_start_link)],
             SCRAPE_END_LINK:   [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_end_link)],
-            SCRAPE_DEST: [
-                CallbackQueryHandler(scrape_dest_callback, pattern=f"^{_DEST_PREFIX}"),
-            ],
+            SCRAPE_DEST:       [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_dest_number)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
